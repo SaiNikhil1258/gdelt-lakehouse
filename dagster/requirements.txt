@@ -1,0 +1,6 @@
+dagster==1.8.12
+dagster-webserver==1.8.12
+dagster-postgres==0.24.12
+dagster-docker==0.24.12
+pyspark==3.5
+requests==2.32.3

@@ -1,0 +1,250 @@
+version: "3.9"
+
+networks:
+  lakehouse-net:
+    driver: bridge
+
+volumes:
+  minio_data:
+  iceberg_catalog_data:
+  postgres_data:
+  spark_jars:
+
+services:
+
+  # ───────────────────────── Object Storage ─────────────────────────
+  minio:
+    image: minio/minio:latest    
+    container_name: minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks: [lakehouse-net]
+
+  mc-init:
+    image: minio/mc:latest
+    container_name: mc-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} &&
+      mc mb --ignore-existing local/${WAREHOUSE_BUCKET} &&
+      mc mb --ignore-existing local/gdelt-landing &&
+      exit 0
+      "
+    networks: [lakehouse-net]
+
+  # ─────────────── Shared Iceberg client jars (one download, no drift) ───────────────
+  jar-fetcher:
+    image: curlimages/curl:8.10.1
+    container_name: jar-fetcher
+    user: root
+    volumes:
+      - spark_jars:/opt/iceberg-jars
+    environment:
+      ICEBERG_VERSION: ${ICEBERG_VERSION}
+      HADOOP_AWS_VERSION: ${HADOOP_AWS_VERSION}
+      AWS_SDK_BUNDLE_VERSION: ${AWS_SDK_BUNDLE_VERSION}
+      AWS_SDK_V2_BUNDLE_VERSION: ${AWS_SDK_V2_BUNDLE_VERSION}
+    entrypoint: >
+      /bin/sh -c "
+      curl -sL -o /opt/iceberg-jars/iceberg-spark-runtime-3.5_2.12-${ICEBERG_VERSION}.jar
+      https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/${ICEBERG_VERSION}/iceberg-spark-runtime-3.5_2.12-${ICEBERG_VERSION}.jar &&
+      curl -sL -o /opt/iceberg-jars/hadoop-aws-${HADOOP_AWS_VERSION}.jar
+      https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar &&
+      curl -sL -o /opt/iceberg-jars/aws-java-sdk-bundle-${AWS_SDK_BUNDLE_VERSION}.jar
+      https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_BUNDLE_VERSION}/aws-java-sdk-bundle-${AWS_SDK_BUNDLE_VERSION}.jar &&
+      curl -sL -o /opt/iceberg-jars/awssdk-bundle-${AWS_SDK_V2_BUNDLE_VERSION}.jar
+      https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/${AWS_SDK_V2_BUNDLE_VERSION}/bundle-${AWS_SDK_V2_BUNDLE_VERSION}.jar &&
+      echo 'Iceberg client jars ready.'
+      "
+    networks: [lakehouse-net]
+
+  # ─────── Iceberg REST Catalog's OWN metadata store (the fix) ───────
+  # Separate from dagster-postgres below. This backs the catalog SERVER's
+  # own table registry so restarting iceberg-rest doesn't forget every table.
+  iceberg-catalog-db:
+    image: postgres:15
+    container_name: iceberg-catalog-db
+    environment:
+      POSTGRES_USER: ${ICEBERG_CATALOG_DB_USER}
+      POSTGRES_PASSWORD: ${ICEBERG_CATALOG_DB_PASSWORD}
+      POSTGRES_DB: ${ICEBERG_CATALOG_DB_NAME}
+    volumes:
+      - iceberg_catalog_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ICEBERG_CATALOG_DB_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks: [lakehouse-net]
+
+  # ───────────────────────── Iceberg REST Catalog ─────────────────────────
+  iceberg-rest:
+    image: tabulario/iceberg-rest:1.6.0
+    container_name: iceberg-rest
+    depends_on:
+      mc-init:
+        condition: service_completed_successfully
+      iceberg-catalog-db:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_REGION: ${AWS_REGION}
+      CATALOG_WAREHOUSE: s3://${WAREHOUSE_BUCKET}/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      # The catalog server's own JDBC persistence -- NOT the same thing as
+      # the CATALOG_URI env var passed to Spark/Dagster elsewhere (that one
+      # is the client-facing REST endpoint). Same name, different purpose.
+      CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
+      CATALOG_URI: jdbc:postgresql://iceberg-catalog-db:5432/${ICEBERG_CATALOG_DB_NAME}
+      CATALOG_JDBC_USER: ${ICEBERG_CATALOG_DB_USER}
+      CATALOG_JDBC_PASSWORD: ${ICEBERG_CATALOG_DB_PASSWORD}
+    ports:
+      - "8181:8181"
+    networks: [lakehouse-net]
+
+  # ───────────────────────── Spark Standalone Cluster ─────────────────────────
+  spark-master:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark-master
+    depends_on:
+      jar-fetcher:
+        condition: service_completed_successfully
+      iceberg-rest:
+        condition: service_started
+    environment:
+      SPARK_MODE: master
+      AWS_REGION: us-east-1
+    ports:
+      - "7077:7077"
+      - "8080:8080"
+    volumes:
+      - spark_jars:/opt/iceberg-jars:ro
+      - ./spark/jobs:/opt/jobs
+    networks: [lakehouse-net]
+
+  spark-worker:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark-worker
+    depends_on: [spark-master]
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      AWS_REGION: us-east-1
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 2G
+    ports:
+      - "8081:8081"
+    volumes:
+      - spark_jars:/opt/iceberg-jars:ro
+      - ./spark/jobs:/opt/jobs
+    networks: [lakehouse-net]
+
+  # ───────────────────────── Dagster's OWN metadata store ─────────────────────────
+  dagster-postgres:
+    image: postgres:15
+    container_name: dagster-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks: [lakehouse-net]
+
+  dagster-user-code:
+    build:
+      context: ./dagster
+      dockerfile: Dockerfile
+    image: gdelt-dagster:latest
+    container_name: dagster-user-code
+    depends_on:
+      jar-fetcher:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_started
+    environment:
+      DAGSTER_POSTGRES_USER: ${POSTGRES_USER}
+      DAGSTER_POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      DAGSTER_POSTGRES_DB: ${POSTGRES_DB}
+      SPARK_MASTER_URL: spark://spark-master:7077
+      CATALOG_URI: ${CATALOG_URI}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      WAREHOUSE_BUCKET: ${WAREHOUSE_BUCKET}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
+    volumes:
+      - spark_jars:/opt/iceberg-jars:ro
+      - ./spark/jobs:/opt/jobs
+      - ./dagster/gdelt_pipeline:/opt/dagster/app/gdelt_pipeline   # dev: edit + `docker compose restart dagster-user-code`, no rebuild needed
+    ports:
+      - "4000:4000"
+    networks: [lakehouse-net]
+
+  dagster-webserver:
+    build:
+      context: ./dagster
+      dockerfile: Dockerfile
+    image: gdelt-dagster:latest
+    container_name: dagster-webserver
+    entrypoint: ["dagster-webserver", "-h", "0.0.0.0", "-p", "3000", "-w", "workspace.yaml"]
+    depends_on:
+      dagster-postgres:
+        condition: service_healthy
+      dagster-user-code:
+        condition: service_started
+    environment:
+      DAGSTER_POSTGRES_USER: ${POSTGRES_USER}
+      DAGSTER_POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      DAGSTER_POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "3000:3000"
+    networks: [lakehouse-net]
+
+  dagster-daemon:
+    build:
+      context: ./dagster
+      dockerfile: Dockerfile
+    image: gdelt-dagster:latest
+    container_name: dagster-daemon
+    entrypoint: ["dagster-daemon", "run"]
+    depends_on:
+      dagster-postgres:
+        condition: service_healthy
+      dagster-user-code:
+        condition: service_started
+    environment:
+      DAGSTER_POSTGRES_USER: ${POSTGRES_USER}
+      DAGSTER_POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      DAGSTER_POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [lakehouse-net]

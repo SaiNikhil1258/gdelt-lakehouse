@@ -1,0 +1,1333 @@
+.env
+---
+# ---- MinIO / S3 ----
+MINIO_ROOT_USER=admin
+MINIO_ROOT_PASSWORD=changeme123
+AWS_ACCESS_KEY_ID=admin
+AWS_SECRET_ACCESS_KEY=changeme123
+AWS_REGION=us-east-1
+AWS_SDK_V2_BUNDLE_VERSION=2.20.160
+WAREHOUSE_BUCKET=warehouse
+
+# ---- Iceberg REST Catalog: client-facing endpoint ----
+# Used by Spark and Dagster to REACH the catalog server.
+CATALOG_URI=http://iceberg-rest:8181
+
+# ---- Iceberg REST Catalog: its OWN backing store ----
+# A different concern from the line above -- this is where the catalog
+# SERVER persists table registrations. Without it, tables vanish on restart.
+ICEBERG_CATALOG_DB_USER=iceberg
+ICEBERG_CATALOG_DB_PASSWORD=iceberg
+ICEBERG_CATALOG_DB_NAME=iceberg_catalog
+
+# ---- Dagster's own run/event metadata store (unrelated to the above) ----
+POSTGRES_USER=dagster
+POSTGRES_PASSWORD=dagster
+POSTGRES_DB=dagster
+
+# ---- Alerting ----
+SLACK_WEBHOOK_URL=
+
+# ---- Pinned versions ----
+SPARK_VERSION=3.5.3
+ICEBERG_VERSION=1.6.1
+HADOOP_AWS_VERSION=3.3.4
+AWS_SDK_BUNDLE_VERSION=1.12.262
+
+---
+docker-compose.yml
+---
+version: "3.9"
+
+networks:
+  lakehouse-net:
+    driver: bridge
+
+volumes:
+  minio_data:
+  iceberg_catalog_data:
+  postgres_data:
+  spark_jars:
+
+services:
+
+  # ───────────────────────── Object Storage ─────────────────────────
+  minio:
+    image: minio/minio:latest    
+    container_name: minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks: [lakehouse-net]
+
+  mc-init:
+    image: minio/mc:latest
+    container_name: mc-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} &&
+      mc mb --ignore-existing local/${WAREHOUSE_BUCKET} &&
+      mc mb --ignore-existing local/gdelt-landing &&
+      exit 0
+      "
+    networks: [lakehouse-net]
+
+  # ─────────────── Shared Iceberg client jars (one download, no drift) ───────────────
+  jar-fetcher:
+    image: curlimages/curl:8.10.1
+    container_name: jar-fetcher
+    user: root
+    volumes:
+      - spark_jars:/opt/iceberg-jars
+    environment:
+      ICEBERG_VERSION: ${ICEBERG_VERSION}
+      HADOOP_AWS_VERSION: ${HADOOP_AWS_VERSION}
+      AWS_SDK_BUNDLE_VERSION: ${AWS_SDK_BUNDLE_VERSION}
+      AWS_SDK_V2_BUNDLE_VERSION: ${AWS_SDK_V2_BUNDLE_VERSION}
+    entrypoint: >
+      /bin/sh -c "
+      curl -sL -o /opt/iceberg-jars/iceberg-spark-runtime-3.5_2.12-${ICEBERG_VERSION}.jar
+      https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/${ICEBERG_VERSION}/iceberg-spark-runtime-3.5_2.12-${ICEBERG_VERSION}.jar &&
+      curl -sL -o /opt/iceberg-jars/hadoop-aws-${HADOOP_AWS_VERSION}.jar
+      https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar &&
+      curl -sL -o /opt/iceberg-jars/aws-java-sdk-bundle-${AWS_SDK_BUNDLE_VERSION}.jar
+      https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_BUNDLE_VERSION}/aws-java-sdk-bundle-${AWS_SDK_BUNDLE_VERSION}.jar &&
+      curl -sL -o /opt/iceberg-jars/awssdk-bundle-${AWS_SDK_V2_BUNDLE_VERSION}.jar
+      https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/${AWS_SDK_V2_BUNDLE_VERSION}/bundle-${AWS_SDK_V2_BUNDLE_VERSION}.jar &&
+      echo 'Iceberg client jars ready.'
+      "
+    networks: [lakehouse-net]
+
+  # ─────── Iceberg REST Catalog's OWN metadata store (the fix) ───────
+  # Separate from dagster-postgres below. This backs the catalog SERVER's
+  # own table registry so restarting iceberg-rest doesn't forget every table.
+  iceberg-catalog-db:
+    image: postgres:15
+    container_name: iceberg-catalog-db
+    environment:
+      POSTGRES_USER: ${ICEBERG_CATALOG_DB_USER}
+      POSTGRES_PASSWORD: ${ICEBERG_CATALOG_DB_PASSWORD}
+      POSTGRES_DB: ${ICEBERG_CATALOG_DB_NAME}
+    volumes:
+      - iceberg_catalog_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ICEBERG_CATALOG_DB_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks: [lakehouse-net]
+
+  # ───────────────────────── Iceberg REST Catalog ─────────────────────────
+  iceberg-rest:
+    image: tabulario/iceberg-rest:1.6.0
+    container_name: iceberg-rest
+    depends_on:
+      mc-init:
+        condition: service_completed_successfully
+      iceberg-catalog-db:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_REGION: ${AWS_REGION}
+      CATALOG_WAREHOUSE: s3://${WAREHOUSE_BUCKET}/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      # The catalog server's own JDBC persistence -- NOT the same thing as
+      # the CATALOG_URI env var passed to Spark/Dagster elsewhere (that one
+      # is the client-facing REST endpoint). Same name, different purpose.
+      CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
+      CATALOG_URI: jdbc:postgresql://iceberg-catalog-db:5432/${ICEBERG_CATALOG_DB_NAME}
+      CATALOG_JDBC_USER: ${ICEBERG_CATALOG_DB_USER}
+      CATALOG_JDBC_PASSWORD: ${ICEBERG_CATALOG_DB_PASSWORD}
+    ports:
+      - "8181:8181"
+    networks: [lakehouse-net]
+
+  # ───────────────────────── Spark Standalone Cluster ─────────────────────────
+  spark-master:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark-master
+    depends_on:
+      jar-fetcher:
+        condition: service_completed_successfully
+      iceberg-rest:
+        condition: service_started
+    environment:
+      SPARK_MODE: master
+      AWS_REGION: us-east-1
+    ports:
+      - "7077:7077"
+      - "8080:8080"
+    volumes:
+      - spark_jars:/opt/iceberg-jars:ro
+      - ./spark/jobs:/opt/jobs
+    networks: [lakehouse-net]
+
+  spark-worker:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark-worker
+    depends_on: [spark-master]
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      AWS_REGION: us-east-1
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 2G
+    ports:
+      - "8081:8081"
+    volumes:
+      - spark_jars:/opt/iceberg-jars:ro
+      - ./spark/jobs:/opt/jobs
+    networks: [lakehouse-net]
+
+  # ───────────────────────── Dagster's OWN metadata store ─────────────────────────
+  dagster-postgres:
+    image: postgres:15
+    container_name: dagster-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks: [lakehouse-net]
+
+  dagster-user-code:
+    build:
+      context: ./dagster
+      dockerfile: Dockerfile
+    image: gdelt-dagster:latest
+    container_name: dagster-user-code
+    depends_on:
+      jar-fetcher:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_started
+    environment:
+      DAGSTER_POSTGRES_USER: ${POSTGRES_USER}
+      DAGSTER_POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      DAGSTER_POSTGRES_DB: ${POSTGRES_DB}
+      SPARK_MASTER_URL: spark://spark-master:7077
+      CATALOG_URI: ${CATALOG_URI}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      WAREHOUSE_BUCKET: ${WAREHOUSE_BUCKET}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
+    volumes:
+      - spark_jars:/opt/iceberg-jars:ro
+      - ./spark/jobs:/opt/jobs
+      - ./dagster/gdelt_pipeline:/opt/dagster/app/gdelt_pipeline   # dev: edit + `docker compose restart dagster-user-code`, no rebuild needed
+    ports:
+      - "4000:4000"
+    networks: [lakehouse-net]
+
+  dagster-webserver:
+    build:
+      context: ./dagster
+      dockerfile: Dockerfile
+    image: gdelt-dagster:latest
+    container_name: dagster-webserver
+    entrypoint: ["dagster-webserver", "-h", "0.0.0.0", "-p", "3000", "-w", "workspace.yaml"]
+    depends_on:
+      dagster-postgres:
+        condition: service_healthy
+      dagster-user-code:
+        condition: service_started
+    environment:
+      DAGSTER_POSTGRES_USER: ${POSTGRES_USER}
+      DAGSTER_POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      DAGSTER_POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "3000:3000"
+    networks: [lakehouse-net]
+
+  dagster-daemon:
+    build:
+      context: ./dagster
+      dockerfile: Dockerfile
+    image: gdelt-dagster:latest
+    container_name: dagster-daemon
+    entrypoint: ["dagster-daemon", "run"]
+    depends_on:
+      dagster-postgres:
+        condition: service_healthy
+      dagster-user-code:
+        condition: service_started
+    environment:
+      DAGSTER_POSTGRES_USER: ${POSTGRES_USER}
+      DAGSTER_POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      DAGSTER_POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [lakehouse-net]
+
+---
+Makefile
+---
+up:
+	docker compose up --build -d
+down:
+	docker compose down
+logs:
+	docker compose logs -f
+reset:
+	docker compose down -v   # WARNING: wipes MinIO, Iceberg catalog, and Dagster volumes
+restart-code:
+	docker compose restart dagster-user-code   # fast dev loop, no rebuild
+
+---
+scripts/backfill.py
+---
+
+
+---
+scripts/download_gdelt.py
+---
+import argparse
+import io
+import time
+import zipfile
+import boto3
+import requests
+
+MANIFEST_URL = "http://data.gdeltproject.org/gdeltv2/lastupdate.txt"
+BASE_URL = "http://data.gdeltproject.org/gdeltv2"
+
+STREAM_SUFFIX = {
+    "events": "export.CSV.zip",
+    "mentions": "mentions.CSV.zip",
+    "gkg": "gkg.csv.zip",
+}
+
+def get_latest_timestamp() -> str:
+    resp = requests.get(MANIFEST_URL, timeout=30)
+    resp.raise_for_status()
+    first_line = resp.text.strip().split("\n")[0]
+    _, _, url = first_line.split()
+    return url.rsplit("/", 1)[-1].split(".")[0]
+
+def s3_client():
+    return boto3.client(
+        "s3",
+        endpoint_url="http://localhost:9000",
+        aws_access_key_id="admin",
+        aws_secret_access_key="changeme123",
+    )
+
+def fetch_and_upload(timestamp: str, stream: str, client, max_retries=3, backoff_base=30):
+    url = f"{BASE_URL}/{timestamp}.{STREAM_SUFFIX[stream]}"
+
+    for attempt in range(1, max_retries + 1):
+        resp = requests.get(url, timeout=60)
+
+        if resp.status_code == 404:
+            if attempt < max_retries:
+                wait = backoff_base * attempt   # 30s, 60s, 90s
+                print(f"  [{stream}] 404 on attempt {attempt}/{max_retries} — "
+                      f"GDELT may still be processing this slot, retrying in {wait}s")
+                time.sleep(wait)
+                continue
+            print(f"  [{stream}] SKIPPED after {max_retries} attempts — "
+                  f"this slot genuinely has no {stream} file")
+            return False
+
+        resp.raise_for_status()
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
+            data = z.read(z.namelist()[0])
+
+        key = f"{stream}/{timestamp}.csv"
+        client.put_object(Bucket="gdelt-landing", Key=key, Body=data)
+        print(f"  [{stream}] uploaded s3://gdelt-landing/{key} ({len(data):,} bytes)")
+        return True
+
+    return False
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--timestamp", help="YYYYMMDDHHMMSS, defaults to latest available")
+    parser.add_argument("--streams", nargs="+", default=["events", "mentions", "gkg"])
+    args = parser.parse_args()
+
+    ts = args.timestamp or get_latest_timestamp()
+    print(f"Batch timestamp: {ts}")
+
+    client = s3_client()
+    results = {stream: fetch_and_upload(ts, stream, client) for stream in args.streams}
+
+    failed = [s for s, ok in results.items() if not ok]
+    if failed:
+        print(f"\nIncomplete batch — missing: {failed}")
+    else:
+        print(f"\nComplete batch: {ts}")
+
+---
+spark/Dockerfile
+---
+FROM bitnamilegacy/spark:3.5.3
+
+USER root
+COPY conf/spark-defaults.conf /opt/bitnami/spark/conf/spark-defaults.conf
+USER 1001
+
+---
+spark/jobs/bootstrap_bronze.py
+---
+from pyspark.sql import SparkSession
+from ddl import create_all_bronze_tables
+
+def main():
+    spark = SparkSession.builder.appName("bootstrap-bronze").getOrCreate()
+    create_all_bronze_tables(spark)
+    print("Bronze namespace + tables ready:")
+    spark.sql("SHOW TABLES IN local.bronze").show(truncate=False)
+    spark.stop()
+
+if __name__ == "__main__":
+    main()
+
+---
+spark/jobs/bootstrap_gold.py
+---
+from pyspark.sql import SparkSession
+from gold_ddl import create_all_gold_tables
+
+def main():
+    spark = SparkSession.builder.appName("bootstrap-gold").getOrCreate()
+    create_all_gold_tables(spark)
+    spark.sql("SHOW TABLES IN local.gold").show(truncate=False)
+    spark.stop()
+
+if __name__ == "__main__":
+    main()
+
+---
+spark/jobs/bootstrap_silver.py
+---
+from pyspark.sql import SparkSession
+from silver_ddl import create_all_silver_tables
+
+def main():
+    spark = SparkSession.builder.appName("bootstrap-silver").getOrCreate()
+    create_all_silver_tables(spark)
+    spark.sql("SHOW TABLES IN local.silver").show(truncate=False)
+    spark.stop()
+
+if __name__ == "__main__":
+    main()
+
+---
+spark/jobs/bronze_ingest.py
+---
+# spark/jobs/bronze_ingest.py
+import argparse
+from pyspark.sql import SparkSession, functions as F
+from pyspark.sql.types import StructType
+from schemas import EVENTS_COLUMNS, MENTIONS_COLUMNS, GKG_COLUMNS
+from utils import parse_gdelt_ts
+
+
+def dedup_and_append(spark, batch_df, target_table: str, key_cols: list):
+    """Insert-only idempotency via an explicit left-anti join, since Iceberg's
+    MERGE INTO insert-only optimization was observed to append duplicates
+    unconditionally rather than checking existing keys."""
+    existing_keys = spark.table(target_table).select(*key_cols).distinct()
+    new_rows = batch_df.join(existing_keys, on=key_cols, how="left_anti")
+    new_count = new_rows.count()
+    total_count = batch_df.count()
+    if new_count > 0:
+        new_rows.writeTo(target_table).append()
+    return new_count, total_count
+
+
+def ingest_events_batch(spark, path: str):
+    print(f"Reading events from: {path}")
+    target_table = "local.bronze.events"
+    target_schema = spark.table(target_table).schema
+    
+    # Map exact CSV column order to Iceberg data types
+    csv_schema = StructType([target_schema[col] for col in EVENTS_COLUMNS if col in target_schema.names])
+
+    raw_df = spark.read \
+        .option("sep", "\t") \
+        .option("nullValue", "") \
+        .schema(csv_schema) \
+        .csv(path)
+
+    batch_df = raw_df.withColumn("date_added_ts", parse_gdelt_ts("DATEADDED"))
+    return dedup_and_append(spark, batch_df, target_table, ["GLOBALEVENTID"])
+
+
+def ingest_mentions_batch(spark, path: str):
+    print(f"Reading mentions from: {path}")
+    target_table = "local.bronze.mentions"
+    target_schema = spark.table(target_table).schema
+    
+    csv_schema = StructType([target_schema[col] for col in MENTIONS_COLUMNS if col in target_schema.names])
+
+    raw_df = spark.read \
+        .option("sep", "\t") \
+        .option("nullValue", "") \
+        .schema(csv_schema) \
+        .csv(path)
+
+    # NOTE: fmt below is a placeholder until diagnose_mentions.py output confirms the real format
+    batch_df = raw_df.withColumn("mention_ts", parse_gdelt_ts("MentionTimeDate"))
+    return dedup_and_append(
+        spark, batch_df, target_table,
+        ["GLOBALEVENTID", "MentionIdentifier", "mention_ts"]
+    )
+
+
+def ingest_gkg_batch(spark, path: str):
+    print(f"Reading gkg from: {path}")
+    target_table = "local.bronze.gkg"
+    target_schema = spark.table(target_table).schema
+    
+    csv_schema = StructType([target_schema[col] for col in GKG_COLUMNS if col in target_schema.names])
+
+    raw_df = spark.read \
+        .option("sep", "\t") \
+        .option("nullValue", "") \
+        .schema(csv_schema) \
+        .csv(path)
+
+    batch_df = raw_df.withColumn("gkg_ts", parse_gdelt_ts("DATE"))
+    return dedup_and_append(spark, batch_df, target_table, ["GKGRECORDID"])
+
+
+STREAM_FUNCS = {
+    "events": ingest_events_batch,
+    "mentions": ingest_mentions_batch,
+    "gkg": ingest_gkg_batch,
+}
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--stream", required=True, choices=STREAM_FUNCS.keys())
+    parser.add_argument("--path", required=True)
+    args = parser.parse_args()
+
+    spark = SparkSession.builder.appName(f"bronze-ingest-{args.stream}").getOrCreate()
+    new_count, total_count = STREAM_FUNCS[args.stream](spark, args.path)
+    print(f"{args.stream}: {new_count} new rows written, {total_count} rows in source batch "
+          f"({total_count - new_count} already existed)")
+    spark.stop()
+
+if __name__ == "__main__":
+    main()
+
+---
+spark/jobs/check_left_join.py
+---
+# spark/jobs/check_left_join.py
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.appName("check-left-join").getOrCreate()
+mentions = spark.table("local.silver.mentions_enriched")
+print("Total rows:", mentions.count())
+print("Distinct MentionIdentifier count:", mentions.select("MentionIdentifier").distinct().count())
+mentions.select("MentionIdentifier", "V2Themes").show(10, truncate=80)
+spark.stop()
+
+---
+spark/jobs/check_mention_dedup.py
+---
+# spark/jobs/check_mention_dedup.py
+from pyspark.sql import SparkSession, functions as F
+from utils import normalize_url
+
+spark = SparkSession.builder.appName("check-mention-dedup").getOrCreate()
+
+mentions = spark.table("local.silver.mentions_enriched")
+total = mentions.count()
+distinct_pairs = mentions.select("GLOBALEVENTID", "MentionIdentifier").distinct().count()
+print(f"Total rows: {total}")
+print(f"Distinct (GLOBALEVENTID, MentionIdentifier) pairs: {distinct_pairs}")
+
+print("\n-- Rows where (GLOBALEVENTID, MentionIdentifier) repeats (true duplicates, if any) --")
+mentions.groupBy("GLOBALEVENTID", "MentionIdentifier").count() \
+    .filter("count > 1").show(20, truncate=80)
+
+print("\n-- Checking the other side: does bronze.gkg have duplicate normalized URLs? --")
+gkg = spark.table("local.bronze.gkg").withColumn("norm_url", normalize_url(F.col("DocumentIdentifier")))
+gkg_total = gkg.count()
+gkg_distinct_url = gkg.select("norm_url").distinct().count()
+print(f"bronze.gkg total: {gkg_total}, distinct normalized DocumentIdentifier: {gkg_distinct_url}")
+gkg.groupBy("norm_url").count().filter("count > 1").show(20, truncate=80)
+
+spark.stop()
+
+---
+spark/jobs/ddl.py
+---
+def create_bronze_namespace(spark):
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.bronze")
+
+
+def create_bronze_events_table(spark):
+    spark.sql("""
+        CREATE TABLE IF NOT EXISTS local.bronze.events (
+            GLOBALEVENTID BIGINT, SQLDATE STRING, MonthYear INT, Year INT, FractionDate DOUBLE,
+            Actor1Code STRING, Actor1Name STRING, Actor1CountryCode STRING, Actor1KnownGroupCode STRING,
+            Actor1EthnicCode STRING, Actor1Religion1Code STRING, Actor1Religion2Code STRING,
+            Actor1Type1Code STRING, Actor1Type2Code STRING, Actor1Type3Code STRING,
+            Actor2Code STRING, Actor2Name STRING, Actor2CountryCode STRING, Actor2KnownGroupCode STRING,
+            Actor2EthnicCode STRING, Actor2Religion1Code STRING, Actor2Religion2Code STRING,
+            Actor2Type1Code STRING, Actor2Type2Code STRING, Actor2Type3Code STRING,
+            IsRootEvent INT, EventCode STRING, EventBaseCode STRING, EventRootCode STRING,
+            QuadClass INT, GoldsteinScale DOUBLE, NumMentions INT, NumSources INT, NumArticles INT, AvgTone DOUBLE,
+            Actor1Geo_Type INT, Actor1Geo_FullName STRING, Actor1Geo_CountryCode STRING,
+            Actor1Geo_ADM1Code STRING, Actor1Geo_ADM2Code STRING, Actor1Geo_Lat DOUBLE, Actor1Geo_Long DOUBLE, Actor1Geo_FeatureID STRING,
+            Actor2Geo_Type INT, Actor2Geo_FullName STRING, Actor2Geo_CountryCode STRING,
+            Actor2Geo_ADM1Code STRING, Actor2Geo_ADM2Code STRING, Actor2Geo_Lat DOUBLE, Actor2Geo_Long DOUBLE, Actor2Geo_FeatureID STRING,
+            ActionGeo_Type INT, ActionGeo_FullName STRING, ActionGeo_CountryCode STRING,
+            ActionGeo_ADM1Code STRING, ActionGeo_ADM2Code STRING, ActionGeo_Lat DOUBLE, ActionGeo_Long DOUBLE, ActionGeo_FeatureID STRING,
+            DATEADDED STRING, SOURCEURL STRING,
+            date_added_ts TIMESTAMP
+        )
+        USING iceberg
+        PARTITIONED BY (days(date_added_ts))
+        TBLPROPERTIES ('format-version'='2', 'write.target-file-size-bytes'='134217728')
+    """)
+
+
+def create_bronze_mentions_table(spark):
+    spark.sql("""
+        CREATE TABLE IF NOT EXISTS local.bronze.mentions (
+            GLOBALEVENTID BIGINT, EventTimeDate STRING, MentionTimeDate STRING, MentionType STRING,
+            MentionSourceName STRING, MentionIdentifier STRING, SentenceID INT,
+            Actor1CharOffset INT, Actor2CharOffset INT, ActionCharOffset INT,
+            InRawText INT, Confidence INT, MentionDocLen INT, MentionDocTone DOUBLE,
+            MentionDocTranslationInfo STRING, Extras STRING,
+            mention_ts TIMESTAMP
+        )
+        USING iceberg
+        PARTITIONED BY (days(mention_ts))
+        TBLPROPERTIES ('format-version'='2', 'write.target-file-size-bytes'='134217728')
+    """)
+
+
+def create_bronze_gkg_table(spark):
+    spark.sql("""
+        CREATE TABLE IF NOT EXISTS local.bronze.gkg (
+            GKGRECORDID STRING, DATE STRING, SourceCollectionIdentifier INT, SourceCommonName STRING,
+            DocumentIdentifier STRING, Counts STRING, V2Counts STRING, Themes STRING, V2Themes STRING,
+            Locations STRING, V2Locations STRING, Persons STRING, V2Persons STRING,
+            Organizations STRING, V2Organizations STRING, V2Tone STRING, Dates STRING,
+            GCAM STRING, SharingImage STRING, RelatedImages STRING, SocialImageEmbeds STRING,
+            SocialVideoEmbeds STRING, Quotations STRING, AllNames STRING, Amounts STRING,
+            TranslationInfo STRING, Extras STRING,
+            gkg_ts TIMESTAMP
+        )
+        USING iceberg
+        PARTITIONED BY (days(gkg_ts))
+        TBLPROPERTIES ('format-version'='2', 'write.target-file-size-bytes'='134217728')
+    """)
+
+
+def create_all_bronze_tables(spark):
+    create_bronze_namespace(spark)
+    create_bronze_events_table(spark)
+    create_bronze_mentions_table(spark)
+    create_bronze_gkg_table(spark)
+
+---
+spark/jobs/diagnose_mentions.py
+---
+# spark/jobs/diagnose_mentions.py
+from pyspark.sql import SparkSession
+from schemas import MENTIONS_COLUMNS
+
+spark = SparkSession.builder.appName("diagnose-mentions").getOrCreate()
+raw_df = (spark.read.option("sep", "\t")
+    .csv("s3a://gdelt-landing/mentions/20260912183000.csv")
+    .toDF(*MENTIONS_COLUMNS))
+raw_df.select("GLOBALEVENTID", "EventTimeDate", "MentionTimeDate", "MentionIdentifier").show(5, truncate=False)
+spark.stop()
+
+---
+spark/jobs/gold_aggregate.py
+---
+from pyspark.sql import SparkSession, functions as F
+
+
+def build_bilateral_sentiment(spark):
+    events = spark.table("local.silver.events_india")
+
+    gold = (
+        events
+        .withColumn(
+            "partner_country",
+            F.when(F.col("Actor1CountryCode") == "IND", F.col("Actor2CountryCode"))
+             .otherwise(F.col("Actor1CountryCode"))
+        )
+        .filter(
+            F.col("partner_country").isNotNull() &
+            (F.col("partner_country") != "IND") &
+            (F.col("partner_country") != "")
+        )
+        .groupBy("event_date", "partner_country")
+        .agg(
+            F.count("*").alias("event_count"),
+            F.avg("GoldsteinScale").alias("avg_goldstein"),
+            F.avg("AvgTone").alias("avg_tone"),
+        )
+    )
+
+    row_count = gold.count()
+    gold.writeTo("local.gold.india_bilateral_sentiment_daily").overwritePartitions()
+    return row_count
+
+
+def build_state_conflict(spark):
+    events = spark.table("local.silver.events_india")
+
+    gold = (
+        events
+        .filter(F.col("ActionGeo_ADM1Code").isNotNull())
+        .groupBy("event_date", "ActionGeo_ADM1Code", "conflict_severity")
+        .agg(
+            F.count("*").alias("event_count"),
+            F.avg("GoldsteinScale").alias("avg_goldstein"),
+        )
+        .withColumnRenamed("ActionGeo_ADM1Code", "adm1_code")
+    )
+
+    row_count = gold.count()
+    gold.writeTo("local.gold.india_state_conflict_daily").overwritePartitions()
+    return row_count
+
+
+def merge_mention_counts(spark):
+    """Upsert against the FULL current total for each event -- not an additive
+    delta. See discussion above: Silver is a full recompute, not incremental,
+    so this MERGE must replace each event's totals rather than add to them,
+    or re-running the pipeline would double-count on every run."""
+    mentions = spark.table("local.silver.mentions_enriched")
+
+    agg = (
+        mentions
+        .groupBy("GLOBALEVENTID")
+        .agg(
+            F.count("*").alias("total_mentions"),
+            F.countDistinct("MentionSourceName").alias("total_sources"),
+            F.avg("MentionDocTone").alias("running_avg_tone"),
+        )
+    )
+    agg.createOrReplaceTempView("mention_agg_source")
+
+    spark.sql("""
+        MERGE INTO local.gold.india_event_mention_counts t
+        USING mention_agg_source s
+        ON t.GLOBALEVENTID = s.GLOBALEVENTID
+        WHEN MATCHED THEN UPDATE SET
+            t.total_mentions    = s.total_mentions,
+            t.total_sources     = s.total_sources,
+            t.running_avg_tone  = s.running_avg_tone,
+            t.last_updated_ts   = current_timestamp()
+        WHEN NOT MATCHED THEN INSERT (
+            GLOBALEVENTID, total_mentions, total_sources, running_avg_tone, last_updated_ts
+        ) VALUES (
+            s.GLOBALEVENTID, s.total_mentions, s.total_sources, s.running_avg_tone, current_timestamp()
+        )
+    """)
+
+    return agg.count()
+
+
+def main():
+    spark = SparkSession.builder.appName("gold-aggregate").getOrCreate()
+
+    b = build_bilateral_sentiment(spark)
+    print(f"gold.india_bilateral_sentiment_daily: {b} rows written")
+
+    s = build_state_conflict(spark)
+    print(f"gold.india_state_conflict_daily: {s} rows written")
+
+    m = merge_mention_counts(spark)
+    print(f"gold.india_event_mention_counts: merged against {m} distinct events")
+
+    spark.stop()
+
+if __name__ == "__main__":
+    main()
+
+---
+spark/jobs/gold_ddl.py
+---
+def create_gold_namespace(spark):
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.gold")
+
+
+def create_gold_bilateral_table(spark):
+    spark.sql("""
+        CREATE TABLE IF NOT EXISTS local.gold.india_bilateral_sentiment_daily (
+            event_date DATE,
+            partner_country STRING,
+            event_count BIGINT,
+            avg_goldstein DOUBLE,
+            avg_tone DOUBLE
+        )
+        USING iceberg
+        PARTITIONED BY (months(event_date))
+        TBLPROPERTIES ('format-version'='2')
+    """)
+
+
+def create_gold_state_conflict_table(spark):
+    spark.sql("""
+        CREATE TABLE IF NOT EXISTS local.gold.india_state_conflict_daily (
+            event_date DATE,
+            adm1_code STRING,
+            conflict_severity STRING,
+            event_count BIGINT,
+            avg_goldstein DOUBLE
+        )
+        USING iceberg
+        PARTITIONED BY (months(event_date))
+        TBLPROPERTIES ('format-version'='2')
+    """)
+
+
+def create_gold_mention_counts_table(spark):
+    spark.sql("""
+        CREATE TABLE IF NOT EXISTS local.gold.india_event_mention_counts (
+            GLOBALEVENTID BIGINT,
+            total_mentions BIGINT,
+            total_sources BIGINT,
+            running_avg_tone DOUBLE,
+            last_updated_ts TIMESTAMP
+        )
+        USING iceberg
+        PARTITIONED BY (bucket(16, GLOBALEVENTID))
+        TBLPROPERTIES ('format-version'='2')
+    """)
+
+
+def create_all_gold_tables(spark):
+    create_gold_namespace(spark)
+    create_gold_bilateral_table(spark)
+    create_gold_state_conflict_table(spark)
+    create_gold_mention_counts_table(spark)
+
+---
+spark/jobs/reset_bronze.py
+---
+# spark/jobs/reset_bronze.py
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.appName("reset-bronze").getOrCreate()
+for table in ["events", "mentions", "gkg"]:
+    spark.sql(f"DROP TABLE IF EXISTS local.bronze.{table}")
+    print(f"Dropped local.bronze.{table}")
+spark.stop()
+
+---
+spark/jobs/schemas.py
+---
+EVENTS_COLUMNS = [
+    "GLOBALEVENTID", "SQLDATE", "MonthYear", "Year", "FractionDate",
+    "Actor1Code", "Actor1Name", "Actor1CountryCode", "Actor1KnownGroupCode",
+    "Actor1EthnicCode", "Actor1Religion1Code", "Actor1Religion2Code",
+    "Actor1Type1Code", "Actor1Type2Code", "Actor1Type3Code",
+    "Actor2Code", "Actor2Name", "Actor2CountryCode", "Actor2KnownGroupCode",
+    "Actor2EthnicCode", "Actor2Religion1Code", "Actor2Religion2Code",
+    "Actor2Type1Code", "Actor2Type2Code", "Actor2Type3Code",
+    "IsRootEvent", "EventCode", "EventBaseCode", "EventRootCode",
+    "QuadClass", "GoldsteinScale", "NumMentions", "NumSources", "NumArticles", "AvgTone",
+    "Actor1Geo_Type", "Actor1Geo_FullName", "Actor1Geo_CountryCode",
+    "Actor1Geo_ADM1Code", "Actor1Geo_ADM2Code", "Actor1Geo_Lat", "Actor1Geo_Long", "Actor1Geo_FeatureID",
+    "Actor2Geo_Type", "Actor2Geo_FullName", "Actor2Geo_CountryCode",
+    "Actor2Geo_ADM1Code", "Actor2Geo_ADM2Code", "Actor2Geo_Lat", "Actor2Geo_Long", "Actor2Geo_FeatureID",
+    "ActionGeo_Type", "ActionGeo_FullName", "ActionGeo_CountryCode",
+    "ActionGeo_ADM1Code", "ActionGeo_ADM2Code", "ActionGeo_Lat", "ActionGeo_Long", "ActionGeo_FeatureID",
+    "DATEADDED", "SOURCEURL",
+]
+
+MENTIONS_COLUMNS = [
+    "GLOBALEVENTID", "EventTimeDate", "MentionTimeDate", "MentionType",
+    "MentionSourceName", "MentionIdentifier", "SentenceID",
+    "Actor1CharOffset", "Actor2CharOffset", "ActionCharOffset",
+    "InRawText", "Confidence", "MentionDocLen", "MentionDocTone",
+    "MentionDocTranslationInfo", "Extras",
+]
+
+GKG_COLUMNS = [
+    "GKGRECORDID", "DATE", "SourceCollectionIdentifier", "SourceCommonName",
+    "DocumentIdentifier", "Counts", "V2Counts", "Themes", "V2Themes",
+    "Locations", "V2Locations", "Persons", "V2Persons",
+    "Organizations", "V2Organizations", "V2Tone", "Dates",
+    "GCAM", "SharingImage", "RelatedImages", "SocialImageEmbeds",
+    "SocialVideoEmbeds", "Quotations", "AllNames", "Amounts",
+    "TranslationInfo", "Extras",
+]
+
+---
+spark/jobs/silver_ddl.py
+---
+def create_silver_namespace(spark):
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.silver")
+
+
+def create_silver_events_india_table(spark):
+    spark.sql("""
+        CREATE TABLE IF NOT EXISTS local.silver.events_india (
+            GLOBALEVENTID BIGINT,
+            event_date DATE,
+            Actor1CountryCode STRING,
+            Actor1Name STRING,
+            Actor2CountryCode STRING,
+            Actor2Name STRING,
+            EventRootCode STRING,
+            QuadClass INT,
+            conflict_severity STRING,
+            GoldsteinScale DOUBLE,
+            AvgTone DOUBLE,
+            ActionGeo_CountryCode STRING,
+            ActionGeo_ADM1Code STRING,
+            ActionGeo_Lat DOUBLE,
+            ActionGeo_Long DOUBLE,
+            SOURCEURL STRING
+        )
+        USING iceberg
+        PARTITIONED BY (days(event_date))
+        TBLPROPERTIES ('format-version'='2')
+    """)
+    spark.sql("ALTER TABLE local.silver.events_india WRITE ORDERED BY (ActionGeo_ADM1Code, event_date)")
+
+
+def create_silver_mentions_enriched_table(spark):
+    spark.sql("""
+        CREATE TABLE IF NOT EXISTS local.silver.mentions_enriched (
+            GLOBALEVENTID BIGINT,
+            event_date DATE,
+            MentionSourceName STRING,
+            MentionIdentifier STRING,
+            MentionDocTone DOUBLE,
+            Confidence INT,
+            V2Themes STRING,
+            V2Tone STRING
+        )
+        USING iceberg
+        PARTITIONED BY (days(event_date))
+        TBLPROPERTIES ('format-version'='2')
+    """)
+
+
+def create_all_silver_tables(spark):
+    create_silver_namespace(spark)
+    create_silver_events_india_table(spark)
+    create_silver_mentions_enriched_table(spark)
+
+---
+spark/jobs/silver_transform.py
+---
+from pyspark.sql import SparkSession, functions as F
+from utils import normalize_url
+
+
+def transform_events_india(spark):
+    bronze_events = spark.table("local.bronze.events")
+
+    silver_events = (
+        bronze_events
+        .withColumn("event_date", F.to_date("SQLDATE", "yyyyMMdd"))
+        .filter(
+            (F.col("ActionGeo_CountryCode") == "IN") |
+            (F.col("Actor1CountryCode") == "IND") |
+            (F.col("Actor2CountryCode") == "IND")
+        )
+        .filter(F.col("SOURCEURL").isNotNull() & F.col("GLOBALEVENTID").isNotNull())
+        .withColumn(
+            "conflict_severity",
+            F.when(F.col("QuadClass") == 4, "Material Conflict")
+             .when(F.col("QuadClass") == 3, "Verbal Conflict")
+             .when(F.col("QuadClass") == 2, "Material Cooperation")
+             .otherwise("Verbal Cooperation")
+        )
+        .select(
+            "GLOBALEVENTID", "event_date", "Actor1CountryCode", "Actor1Name",
+            "Actor2CountryCode", "Actor2Name", "EventRootCode", "QuadClass",
+            "conflict_severity", "GoldsteinScale", "AvgTone",
+            "ActionGeo_CountryCode", "ActionGeo_ADM1Code", "ActionGeo_Lat", "ActionGeo_Long",
+            "SOURCEURL"
+        )
+        .dropDuplicates(["GLOBALEVENTID"])  # defensive; Bronze should already guarantee this
+    )
+
+    row_count = silver_events.count()
+    silver_events.writeTo("local.silver.events_india").overwritePartitions()
+    return row_count
+
+
+def transform_mentions_enriched(spark):
+    bronze_mentions = spark.table("local.bronze.mentions")
+    bronze_gkg = spark.table("local.bronze.gkg")
+    silver_events = spark.table("local.silver.events_india").select("GLOBALEVENTID", "event_date")
+
+    silver_mentions = (
+        bronze_mentions.alias("m")
+        .join(
+            bronze_gkg.alias("g"),
+            normalize_url(F.col("m.MentionIdentifier")) == normalize_url(F.col("g.DocumentIdentifier")),
+            "left"
+        )
+        .join(
+            silver_events.alias("e"),
+            F.col("m.GLOBALEVENTID") == F.col("e.GLOBALEVENTID"),
+            "inner"   # scope to India-relevant events only
+        )
+        .select(
+            F.col("m.GLOBALEVENTID"), F.col("e.event_date"),
+            F.col("m.MentionSourceName"), F.col("m.MentionIdentifier"),
+            F.col("m.MentionDocTone"), F.col("m.Confidence"),
+            F.col("g.V2Themes"), F.col("g.V2Tone")
+        )
+    )
+
+    row_count = silver_mentions.count()
+    silver_mentions.writeTo("local.silver.mentions_enriched").overwritePartitions()
+    return row_count
+
+
+def main():
+    spark = SparkSession.builder.appName("silver-transform").getOrCreate()
+    events_count = transform_events_india(spark)
+    print(f"silver.events_india: {events_count} rows written")
+    mentions_count = transform_mentions_enriched(spark)
+    print(f"silver.mentions_enriched: {mentions_count} rows written")
+    spark.stop()
+
+if __name__ == "__main__":
+    main()
+
+---
+spark/jobs/summarize_bronze.py
+---
+# spark/jobs/summarize_bronze.py
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.appName("summarize-bronze").getOrCreate()
+
+for table in ["events", "mentions", "gkg"]:
+    df = spark.table(f"local.bronze.{table}")
+    print(f"{table}: {df.count()} total rows")
+    spark.sql(f"SELECT * FROM local.bronze.{table}.snapshots").select(
+        "committed_at", "operation", "summary"
+    ).show(truncate=False)
+
+spark.stop()
+
+---
+spark/jobs/test_merge_update.py
+---
+"""Standalone check for MERGE INTO ... WHEN MATCHED THEN UPDATE, run once to
+build confidence before Gold's incremental counters depend on it. Uses a
+disposable scratch table -- doesn't touch bronze/silver/gold."""
+from pyspark.sql import SparkSession
+
+def main():
+    spark = SparkSession.builder.appName("test-merge-update").getOrCreate()
+
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.scratch")
+    spark.sql("DROP TABLE IF EXISTS local.scratch.merge_test")
+    spark.sql("""
+        CREATE TABLE local.scratch.merge_test (id BIGINT, val STRING)
+        USING iceberg TBLPROPERTIES ('format-version'='2')
+    """)
+    spark.sql("INSERT INTO local.scratch.merge_test VALUES (1, 'original'), (2, 'original')")
+
+    spark.createDataFrame([(1, "updated"), (3, "new")], ["id", "val"]) \
+        .createOrReplaceTempView("merge_source")
+
+    spark.sql("""
+        MERGE INTO local.scratch.merge_test t
+        USING merge_source s
+        ON t.id = s.id
+        WHEN MATCHED THEN UPDATE SET t.val = s.val
+        WHEN NOT MATCHED THEN INSERT *
+    """)
+
+    rows = spark.sql("SELECT * FROM local.scratch.merge_test ORDER BY id").collect()
+    actual = {row.id: row.val for row in rows}
+    expected = {1: "updated", 2: "original", 3: "new"}
+
+    print("Result after MERGE:", actual)
+    print("PASS" if actual == expected else f"FAIL -- expected {expected}, got {actual}")
+
+    spark.stop()
+
+if __name__ == "__main__":
+    main()
+
+---
+spark/jobs/utils.py
+---
+from pyspark.sql import functions as F
+
+def normalize_url(col):
+    """Lowercase, trim, strip query string — for the Mentions<->GKG soft join."""
+    return F.lower(F.trim(F.regexp_replace(col, r"\?.*$", "")))
+
+def parse_gdelt_ts(col, fmt="yyyyMMddHHmmss"):
+    return F.to_timestamp(col, fmt)
+
+def extract_batch_id(file_path: str) -> str:
+    """20260910143000.export.CSV -> 20260910143000"""
+    return file_path.split("/")[-1].split(".")[0]
+
+---
+spark/jobs/verify_bronze.py
+---
+from pyspark.sql import SparkSession
+
+def main():
+    spark = SparkSession.builder.appName("verify-bronze").getOrCreate()
+
+    checks = {
+        "events": ["GLOBALEVENTID"],
+        "mentions": ["GLOBALEVENTID", "MentionIdentifier", "mention_ts"],
+        "gkg": ["GKGRECORDID"],
+    }
+
+    for table, key_cols in checks.items():
+        df = spark.table(f"local.bronze.{table}")
+        total = df.count()
+        distinct = df.select(*key_cols).distinct().count()
+        nulls = df.filter(" OR ".join(f"{c} IS NULL" for c in key_cols)).count()
+        status = "OK" if total == distinct and nulls == 0 else "PROBLEM"
+        print(f"{table:10s} total={total:6d}  distinct_key={distinct:6d}  null_keys={nulls:3d}  -> {status}")
+
+    spark.stop()
+
+if __name__ == "__main__":
+    main()
+
+---
+spark/jobs/verify_gold.py
+---
+from pyspark.sql import SparkSession, functions as F
+
+def main():
+    spark = SparkSession.builder.appName("verify-gold").getOrCreate()
+
+    bilateral = spark.table("local.gold.india_bilateral_sentiment_daily")
+    print(f"bilateral_sentiment_daily: total={bilateral.count()}")
+
+    state = spark.table("local.gold.india_state_conflict_daily")
+    print(f"state_conflict_daily: total={state.count()}")
+
+    mention_counts = spark.table("local.gold.india_event_mention_counts")
+    m_total = mention_counts.count()
+    m_distinct = mention_counts.select("GLOBALEVENTID").distinct().count()
+    status = "OK" if m_total == m_distinct else "PROBLEM"
+    print(f"event_mention_counts: total={m_total} distinct_ids={m_distinct} -> {status}")
+
+    # Cross-check: every India-relevant event with at least one mention
+    # should have exactly one row in the Gold counter table.
+    silver_event_ids = spark.table("local.silver.mentions_enriched").select("GLOBALEVENTID").distinct().count()
+    print(f"silver.mentions_enriched distinct GLOBALEVENTID: {silver_event_ids} (should equal event_mention_counts total)")
+
+    spark.stop()
+
+if __name__ == "__main__":
+    main()
+
+---
+spark/jobs/verify_silver.py
+---
+from pyspark.sql import SparkSession, functions as F
+
+def main():
+    spark = SparkSession.builder.appName("verify-silver").getOrCreate()
+
+    events = spark.table("local.silver.events_india")
+    total = events.count()
+    distinct_ids = events.select("GLOBALEVENTID").distinct().count()
+
+    valid_india = (
+        (F.col("ActionGeo_CountryCode") == "IN") |
+        (F.col("Actor1CountryCode") == "IND") |
+        (F.col("Actor2CountryCode") == "IND")
+    )
+    non_india = events.filter(~valid_india).count()
+
+    status = "OK" if (total == distinct_ids and non_india == 0) else "PROBLEM"
+    print(f"events_india: total={total} distinct_ids={distinct_ids} non_india_rows={non_india} -> {status}")
+
+    mentions = spark.table("local.silver.mentions_enriched")
+    m_total = mentions.count()
+    matched = mentions.filter(F.col("V2Themes").isNotNull()).count()
+    match_rate = (matched / m_total) if m_total else 0
+    print(f"mentions_enriched: total={m_total} gkg_matched={matched} match_rate={match_rate:.1%}")
+
+    spark.stop()
+
+if __name__ == "__main__":
+    main()
+
+---
+spark/conf/spark-defaults.conf
+---
+spark.sql.extensions                          org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+spark.sql.catalog.local                       org.apache.iceberg.spark.SparkCatalog
+spark.sql.catalog.local.type                  rest
+spark.sql.catalog.local.uri                   http://iceberg-rest:8181
+spark.sql.catalog.local.warehouse             s3://warehouse/
+spark.sql.catalog.local.io-impl               org.apache.iceberg.aws.s3.S3FileIO
+spark.sql.catalog.local.s3.endpoint           http://minio:9000
+spark.sql.catalog.local.s3.path-style-access  true
+spark.sql.catalog.local.s3.access-key-id      admin
+spark.sql.catalog.local.s3.secret-access-key  changeme123
+spark.sql.defaultCatalog                      local
+
+spark.hadoop.fs.s3a.endpoint                  http://minio:9000
+spark.hadoop.fs.s3a.access.key                admin
+spark.hadoop.fs.s3a.secret.key                changeme123
+spark.hadoop.fs.s3a.path.style.access         true
+spark.hadoop.fs.s3a.impl                      org.apache.hadoop.fs.s3a.S3AFileSystem
+
+spark.driver.extraClassPath                   /opt/iceberg-jars/*
+spark.executor.extraClassPath                 /opt/iceberg-jars/*
+
+spark.sql.adaptive.enabled                     true
+spark.sql.adaptive.coalescePartitions.enabled  true
+spark.sql.shuffle.partitions                   8
+spark.sql.autoBroadcastJoinThreshold           10485760
+spark.sql.catalogImplementation                in-memory
+
+---
+dagster/Dockerfile
+---
+FROM python:3.11-slim-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openjdk-17-jre-headless curl \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+ENV DAGSTER_HOME=/opt/dagster/dagster_home
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+WORKDIR /opt/dagster/app
+COPY gdelt_pipeline ./gdelt_pipeline
+COPY workspace.yaml ./workspace.yaml
+
+RUN mkdir -p $DAGSTER_HOME
+COPY dagster.yaml $DAGSTER_HOME/dagster.yaml
+
+EXPOSE 4000 3000
+
+ENTRYPOINT ["dagster", "api", "grpc", "-h", "0.0.0.0", "-p", "4000", "-m", "gdelt_pipeline"]
+
+---
+dagster/dagster.yaml
+---
+run_coordinator:
+  module: dagster.core.run_coordinator
+  class: QueuedRunCoordinator
+  config:
+    max_concurrent_runs: 4   # caps DockerRunLauncher's container spawning if runs back up
+
+run_storage:
+  module: dagster_postgres.run_storage
+  class: PostgresRunStorage
+  config:
+    postgres_db:
+      username: { env: DAGSTER_POSTGRES_USER }
+      password: { env: DAGSTER_POSTGRES_PASSWORD }
+      hostname: dagster-postgres
+      db_name: { env: DAGSTER_POSTGRES_DB }
+      port: 5432
+
+event_log_storage:
+  module: dagster_postgres.event_log
+  class: PostgresEventLogStorage
+  config:
+    postgres_db:
+      username: { env: DAGSTER_POSTGRES_USER }
+      password: { env: DAGSTER_POSTGRES_PASSWORD }
+      hostname: dagster-postgres
+      db_name: { env: DAGSTER_POSTGRES_DB }
+      port: 5432
+
+schedule_storage:
+  module: dagster_postgres.schedule_storage
+  class: PostgresScheduleStorage
+  config:
+    postgres_db:
+      username: { env: DAGSTER_POSTGRES_USER }
+      password: { env: DAGSTER_POSTGRES_PASSWORD }
+      hostname: dagster-postgres
+      db_name: { env: DAGSTER_POSTGRES_DB }
+      port: 5432
+
+scheduler:
+  module: dagster.core.scheduler
+  class: DagsterDaemonScheduler
+
+run_launcher:
+  module: dagster_docker
+  class: DockerRunLauncher
+  config:
+    network: lakehouse-net
+    env_vars:
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - CATALOG_URI
+      - WAREHOUSE_BUCKET
+      - SPARK_MASTER_URL
+      - SLACK_WEBHOOK_URL
+    container_kwargs:
+      volumes:
+        - "spark_jars:/opt/iceberg-jars:ro"
+
+---
+dagster/requirements.txt
+---
+dagster==1.8.12
+dagster-webserver==1.8.12
+dagster-postgres==0.24.12
+dagster-docker==0.24.12
+pyspark==3.5
+requests==2.32.3
+
+---
+dagster/workspace.yaml
+---
+load_from:
+  - grpc_server:
+      host: dagster-user-code
+      port: 4000
+      location_name: "gdelt_lakehouse"
+
+---
