@@ -1,3 +1,5 @@
-[pytest]
-testpaths = tests
-pythonpath = spark/jobs dagster scripts
+pyspark==3.5.3
+boto3==1.35.36
+requests==2.32.3
+pytest>=8,<9
+ruff>=0.6

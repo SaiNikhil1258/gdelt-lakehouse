@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 *.egg-info/
 dagster_home/
-.DS_Store.backfill.lock
+.DS_Store
+.backfill.lock
 *.log
 .ipynb_checkpoints/

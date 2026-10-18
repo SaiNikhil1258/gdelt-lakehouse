@@ -1,4 +1,5 @@
 from pyspark.sql import SparkSession, functions as F
+from utils import partner_country
 
 
 def build_bilateral_sentiment(spark):
@@ -8,14 +9,9 @@ def build_bilateral_sentiment(spark):
         events
         .withColumn(
             "partner_country",
-            F.when(F.col("Actor1CountryCode") == "IND", F.col("Actor2CountryCode"))
-             .otherwise(F.col("Actor1CountryCode"))
+            partner_country(F.col("Actor1CountryCode"), F.col("Actor2CountryCode")),
         )
-        .filter(
-            F.col("partner_country").isNotNull() &
-            (F.col("partner_country") != "IND") &
-            (F.col("partner_country") != "")
-        )
+        .filter(F.col("partner_country").isNotNull() & (F.col("partner_country") != ""))
         .groupBy("event_date", "partner_country")
         .agg(
             F.count("*").alias("event_count"),
@@ -25,7 +21,10 @@ def build_bilateral_sentiment(spark):
     )
 
     row_count = gold.count()
-    gold.writeTo("local.gold.india_bilateral_sentiment_daily").overwritePartitions()
+    # Full recompute -> replace the whole table in one commit. overwritePartitions() only
+    # replaces partitions that appear in the new data, so a month that no longer has any
+    # rows (e.g. after a logic fix) would keep its old rows forever.
+    gold.writeTo("local.gold.india_bilateral_sentiment_daily").overwrite(F.lit(True))
     return row_count
 
 
@@ -34,7 +33,10 @@ def build_state_conflict(spark):
 
     gold = (
         events
-        .filter(F.col("ActionGeo_ADM1Code").isNotNull())
+        .filter(
+            (F.col("ActionGeo_CountryCode") == "IN") &
+            F.col("ActionGeo_ADM1Code").isNotNull()
+        )
         .groupBy("event_date", "ActionGeo_ADM1Code", "conflict_severity")
         .agg(
             F.count("*").alias("event_count"),
@@ -44,7 +46,10 @@ def build_state_conflict(spark):
     )
 
     row_count = gold.count()
-    gold.writeTo("local.gold.india_state_conflict_daily").overwritePartitions()
+    # Full recompute -> replace the whole table in one commit. overwritePartitions() only
+    # replaces partitions that appear in the new data, so a month that no longer has any
+    # rows (e.g. after a logic fix) would keep its old rows forever.
+    gold.writeTo("local.gold.india_state_conflict_daily").overwrite(F.lit(True))
     return row_count
 
 

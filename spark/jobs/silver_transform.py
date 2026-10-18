@@ -1,5 +1,5 @@
 from pyspark.sql import SparkSession, functions as F
-from utils import normalize_url
+from utils import normalize_url, conflict_severity
 
 
 def transform_events_india(spark):
@@ -14,13 +14,7 @@ def transform_events_india(spark):
             (F.col("Actor2CountryCode") == "IND")
         )
         .filter(F.col("SOURCEURL").isNotNull() & F.col("GLOBALEVENTID").isNotNull())
-        .withColumn(
-            "conflict_severity",
-            F.when(F.col("QuadClass") == 4, "Material Conflict")
-             .when(F.col("QuadClass") == 3, "Verbal Conflict")
-             .when(F.col("QuadClass") == 2, "Material Cooperation")
-             .otherwise("Verbal Cooperation")
-        )
+        .withColumn("conflict_severity", conflict_severity(F.col("QuadClass")))
         .select(
             "GLOBALEVENTID", "event_date", "Actor1CountryCode", "Actor1Name",
             "Actor2CountryCode", "Actor2Name", "EventRootCode", "QuadClass",

@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from pyspark.sql import SparkSession, functions as F
 
 from bronze_ingest import MENTIONS_KEY
+from utils import partner_country
 
 LANDING = "s3a://gdelt-landing"
 
@@ -147,7 +148,7 @@ def main():
 
     out_of_range = spark.table(BRONZE["events"]["table"]).filter(
         (F.col("GoldsteinScale") < -10) | (F.col("GoldsteinScale") > 10)
-        | (~F.col("QuadClass").isin(1, 2, 3, 4))
+        | (F.col("QuadClass").isNull() | ~F.col("QuadClass").isin(1, 2, 3, 4))
         | (F.abs(F.col("AvgTone")) > 100)
         | (F.col("ActionGeo_Lat") < -90) | (F.col("ActionGeo_Lat") > 90)
         | (F.col("ActionGeo_Long") < -180) | (F.col("ActionGeo_Long") > 180)
@@ -183,15 +184,16 @@ def main():
     report.check("Silver: every mention belongs to a Silver event", orphans == 0,
                  f"orphan_mentions={orphans}")
 
-    partner = F.when(F.col("Actor1CountryCode") == "IND", F.col("Actor2CountryCode")) \
-               .otherwise(F.col("Actor1CountryCode"))
-    expected = silver_events.filter(partner.isNotNull() & (partner != "IND") & (partner != "")).count()
+    partner = partner_country(F.col("Actor1CountryCode"), F.col("Actor2CountryCode"))
+    expected = silver_events.filter(partner.isNotNull() & (partner != "")).count()
     actual = spark.table("local.gold.india_bilateral_sentiment_daily") \
         .agg(F.sum("event_count")).first()[0] or 0
     report.check("Silver -> Gold: bilateral event_count sums to the Silver rows it covers",
                  expected == actual, f"silver_rows={expected} gold_sum={actual}")
 
-    expected = silver_events.filter(F.col("ActionGeo_ADM1Code").isNotNull()).count()
+    expected = silver_events.filter(
+        (F.col("ActionGeo_CountryCode") == "IN") & F.col("ActionGeo_ADM1Code").isNotNull()
+    ).count()
     actual = spark.table("local.gold.india_state_conflict_daily") \
         .agg(F.sum("event_count")).first()[0] or 0
     report.check("Silver -> Gold: state-conflict event_count sums to the Silver rows it covers",
