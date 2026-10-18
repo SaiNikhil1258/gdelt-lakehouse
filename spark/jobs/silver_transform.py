@@ -2,10 +2,10 @@ from pyspark.sql import SparkSession, functions as F
 from utils import normalize_url, conflict_severity
 
 
-def transform_events_india(spark):
-    bronze_events = spark.table("local.bronze.events")
-
-    silver_events = (
+def build_events_india(bronze_events):
+    """Bronze events -> Silver India events. Pure DataFrame logic (no table access), so it
+    can be unit-tested on small fixtures."""
+    return (
         bronze_events
         .withColumn("event_date", F.to_date("SQLDATE", "yyyyMMdd"))
         .filter(
@@ -25,12 +25,15 @@ def transform_events_india(spark):
         .dropDuplicates(["GLOBALEVENTID"])  # defensive; Bronze should already guarantee this
     )
 
+
+def transform_events_india(spark):
+    silver_events = build_events_india(spark.table("local.bronze.events"))
     row_count = silver_events.count()
     silver_events.writeTo("local.silver.events_india").overwritePartitions()
     return row_count
 
 
-def transform_mentions_enriched(spark):
+def build_mentions_enriched(bronze_mentions, bronze_gkg, silver_events):
     """One row per (GLOBALEVENTID, MentionIdentifier), i.e. per article that mentions an
     India-relevant event.
 
@@ -46,9 +49,7 @@ def transform_mentions_enriched(spark):
        This tie-break is a deterministic choice, not a verified 'best' row.
     3. LEFT JOIN, so mentions without a GKG record (e.g. during a GKG stall) are kept.
     """
-    bronze_mentions = spark.table("local.bronze.mentions")
-    bronze_gkg = spark.table("local.bronze.gkg")
-    silver_events = spark.table("local.silver.events_india").select("GLOBALEVENTID", "event_date")
+    silver_events = silver_events.select("GLOBALEVENTID", "event_date")
 
     pairs = (
         bronze_mentions.alias("m")
@@ -84,7 +85,7 @@ def transform_mentions_enriched(spark):
         )
     )
 
-    silver_mentions = (
+    return (
         pairs.join(gkg_one_per_url, "norm_url", "left")
         .select(
             "GLOBALEVENTID", "event_date", "MentionSourceName", "MentionIdentifier",
@@ -92,6 +93,13 @@ def transform_mentions_enriched(spark):
         )
     )
 
+
+def transform_mentions_enriched(spark):
+    silver_mentions = build_mentions_enriched(
+        spark.table("local.bronze.mentions"),
+        spark.table("local.bronze.gkg"),
+        spark.table("local.silver.events_india"),
+    )
     row_count = silver_mentions.count()
     silver_mentions.writeTo("local.silver.mentions_enriched").overwritePartitions()
     return row_count

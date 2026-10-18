@@ -1,11 +1,15 @@
 from pyspark.sql import SparkSession, functions as F
 from utils import partner_country
 
+# The two daily tables are full recomputes, so they are replaced in one commit with
+# overwrite(F.lit(True)). overwritePartitions() only replaces partitions that appear in the
+# new data, so a month that no longer has any rows would keep its old rows forever.
 
-def build_bilateral_sentiment(spark):
-    events = spark.table("local.silver.events_india")
 
-    gold = (
+def compute_bilateral_sentiment(events):
+    """Silver events -> one row per (event_date, partner country). Only events where India
+    is exactly one of the two actors count; the other actor is the partner."""
+    return (
         events
         .withColumn(
             "partner_country",
@@ -20,18 +24,11 @@ def build_bilateral_sentiment(spark):
         )
     )
 
-    row_count = gold.count()
-    # Full recompute -> replace the whole table in one commit. overwritePartitions() only
-    # replaces partitions that appear in the new data, so a month that no longer has any
-    # rows (e.g. after a logic fix) would keep its old rows forever.
-    gold.writeTo("local.gold.india_bilateral_sentiment_daily").overwrite(F.lit(True))
-    return row_count
 
-
-def build_state_conflict(spark):
-    events = spark.table("local.silver.events_india")
-
-    gold = (
+def compute_state_conflict(events):
+    """Silver events -> one row per (event_date, Indian state, severity). Only events that
+    happened in India count."""
+    return (
         events
         .filter(
             (F.col("ActionGeo_CountryCode") == "IN") &
@@ -45,22 +42,10 @@ def build_state_conflict(spark):
         .withColumnRenamed("ActionGeo_ADM1Code", "adm1_code")
     )
 
-    row_count = gold.count()
-    # Full recompute -> replace the whole table in one commit. overwritePartitions() only
-    # replaces partitions that appear in the new data, so a month that no longer has any
-    # rows (e.g. after a logic fix) would keep its old rows forever.
-    gold.writeTo("local.gold.india_state_conflict_daily").overwrite(F.lit(True))
-    return row_count
 
-
-def merge_mention_counts(spark):
-    """Upsert against the FULL current total for each event -- not an additive
-    delta. See discussion above: Silver is a full recompute, not incremental,
-    so this MERGE must replace each event's totals rather than add to them,
-    or re-running the pipeline would double-count on every run."""
-    mentions = spark.table("local.silver.mentions_enriched")
-
-    agg = (
+def compute_mention_counts(mentions):
+    """Silver mentions -> one row per event with its FULL current totals."""
+    return (
         mentions
         .groupBy("GLOBALEVENTID")
         .agg(
@@ -69,6 +54,28 @@ def merge_mention_counts(spark):
             F.avg("MentionDocTone").alias("running_avg_tone"),
         )
     )
+
+
+def build_bilateral_sentiment(spark):
+    gold = compute_bilateral_sentiment(spark.table("local.silver.events_india"))
+    row_count = gold.count()
+    gold.writeTo("local.gold.india_bilateral_sentiment_daily").overwrite(F.lit(True))
+    return row_count
+
+
+def build_state_conflict(spark):
+    gold = compute_state_conflict(spark.table("local.silver.events_india"))
+    row_count = gold.count()
+    gold.writeTo("local.gold.india_state_conflict_daily").overwrite(F.lit(True))
+    return row_count
+
+
+def merge_mention_counts(spark):
+    """Upsert against the FULL current total for each event -- not an additive
+    delta. Silver is a full recompute, not incremental, so this MERGE must replace
+    each event's totals rather than add to them, or re-running the pipeline would
+    double-count on every run."""
+    agg = compute_mention_counts(spark.table("local.silver.mentions_enriched"))
     agg.createOrReplaceTempView("mention_agg_source")
 
     spark.sql("""
@@ -103,6 +110,7 @@ def main():
     print(f"gold.india_event_mention_counts: merged against {m} distinct events")
 
     spark.stop()
+
 
 if __name__ == "__main__":
     main()
