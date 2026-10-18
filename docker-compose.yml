@@ -1,7 +1,7 @@
-version: "3.9"
 
 networks:
   lakehouse-net:
+    name: lakehouse-net
     driver: bridge
 
 volumes:
@@ -9,6 +9,7 @@ volumes:
   iceberg_catalog_data:
   postgres_data:
   spark_jars:
+    name: spark_jars
 
 services:
 
@@ -152,14 +153,45 @@ services:
       SPARK_MODE: worker
       SPARK_MASTER_URL: spark://spark-master:7077
       AWS_REGION: us-east-1
-      SPARK_WORKER_CORES: 2
-      SPARK_WORKER_MEMORY: 2G
+      SPARK_WORKER_CORES: 4
+      SPARK_WORKER_MEMORY: 6G
     ports:
       - "8081:8081"
     volumes:
       - spark_jars:/opt/iceberg-jars:ro
       - ./spark/jobs:/opt/jobs
     networks: [lakehouse-net]
+  
+  jupyter:
+    build:
+      context: .
+      dockerfile: notebooks/Dockerfile
+    container_name: gdelt-jupyter
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./notebooks:/home/spark/notebooks
+      - spark_jars:/opt/iceberg-jars:ro
+    networks:
+      - lakehouse-net
+    depends_on:
+      - spark-master
+      - spark-worker
+      - iceberg-rest
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: changeme123
+      AWS_REGION: us-east-1
+      PYSPARK_PYTHON: python3
+      PYSPARK_DRIVER_PYTHON: python3
+      PYSPARK_DRIVER_PYTHON_OPTS: ""
+    command: >
+      jupyter lab
+      --ip=0.0.0.0
+      --port=8888
+      --no-browser
+      --allow-root
+      --ServerApp.token=''
 
   # ───────────────────────── Dagster's OWN metadata store ─────────────────────────
   dagster-postgres:
@@ -180,10 +212,11 @@ services:
 
   dagster-user-code:
     build:
-      context: ./dagster
-      dockerfile: Dockerfile
+      context: .                       # was ./dagster — now project root
+      dockerfile: dagster/Dockerfile
     image: gdelt-dagster:latest
     container_name: dagster-user-code
+    entrypoint: ["dagster", "api", "grpc", "-h", "0.0.0.0", "-p", "4000", "-m", "gdelt_pipeline"]
     depends_on:
       jar-fetcher:
         condition: service_completed_successfully
@@ -198,27 +231,24 @@ services:
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
       WAREHOUSE_BUCKET: ${WAREHOUSE_BUCKET}
+      AWS_REGION: ${AWS_REGION}
       SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
     volumes:
-      - spark_jars:/opt/iceberg-jars:ro
-      - ./spark/jobs:/opt/jobs
-      - ./dagster/gdelt_pipeline:/opt/dagster/app/gdelt_pipeline   # dev: edit + `docker compose restart dagster-user-code`, no rebuild needed
+      - spark_jars:/opt/iceberg-jars:ro   # named volume -- fine for ephemeral containers too
     ports:
       - "4000:4000"
     networks: [lakehouse-net]
 
   dagster-webserver:
     build:
-      context: ./dagster
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: dagster/Dockerfile
     image: gdelt-dagster:latest
     container_name: dagster-webserver
     entrypoint: ["dagster-webserver", "-h", "0.0.0.0", "-p", "3000", "-w", "workspace.yaml"]
     depends_on:
-      dagster-postgres:
-        condition: service_healthy
-      dagster-user-code:
-        condition: service_started
+      dagster-postgres: { condition: service_healthy }
+      dagster-user-code: { condition: service_started }
     environment:
       DAGSTER_POSTGRES_USER: ${POSTGRES_USER}
       DAGSTER_POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -231,20 +261,26 @@ services:
 
   dagster-daemon:
     build:
-      context: ./dagster
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: dagster/Dockerfile
     image: gdelt-dagster:latest
     container_name: dagster-daemon
     entrypoint: ["dagster-daemon", "run"]
     depends_on:
-      dagster-postgres:
-        condition: service_healthy
-      dagster-user-code:
-        condition: service_started
+      dagster-postgres: { condition: service_healthy }
+      dagster-user-code: { condition: service_started }
     environment:
       DAGSTER_POSTGRES_USER: ${POSTGRES_USER}
       DAGSTER_POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       DAGSTER_POSTGRES_DB: ${POSTGRES_DB}
+      # Add the missing variables below so the launcher can access and pass them
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      CATALOG_URI: ${CATALOG_URI}
+      WAREHOUSE_BUCKET: ${WAREHOUSE_BUCKET}
+      AWS_REGION: ${AWS_REGION}
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     networks: [lakehouse-net]

@@ -1,0 +1,1 @@
+from gdelt_pipeline.definitions import defs

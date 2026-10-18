@@ -2,6 +2,9 @@ def create_silver_namespace(spark):
     spark.sql("CREATE NAMESPACE IF NOT EXISTS local.silver")
 
 
+# Partitioned by MONTH of event_date, not day. event_date comes from GDELT's SQLDATE, which
+# for ~1% of events points far into the past (2016 .. today). Day partitions meant ~100
+# partitions of ~50 KB each for one month of data. Gold uses months(event_date) too.
 def create_silver_events_india_table(spark):
     spark.sql("""
         CREATE TABLE IF NOT EXISTS local.silver.events_india (
@@ -23,7 +26,7 @@ def create_silver_events_india_table(spark):
             SOURCEURL STRING
         )
         USING iceberg
-        PARTITIONED BY (days(event_date))
+        PARTITIONED BY (months(event_date))
         TBLPROPERTIES ('format-version'='2')
     """)
     spark.sql("ALTER TABLE local.silver.events_india WRITE ORDERED BY (ActionGeo_ADM1Code, event_date)")
@@ -42,7 +45,7 @@ def create_silver_mentions_enriched_table(spark):
             V2Tone STRING
         )
         USING iceberg
-        PARTITIONED BY (days(event_date))
+        PARTITIONED BY (months(event_date))
         TBLPROPERTIES ('format-version'='2')
     """)
 

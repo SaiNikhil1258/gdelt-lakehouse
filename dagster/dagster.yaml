@@ -37,22 +37,38 @@ schedule_storage:
       db_name: { env: DAGSTER_POSTGRES_DB }
       port: 5432
 
-scheduler:
-  module: dagster.core.scheduler
-  class: DagsterDaemonScheduler
-
 run_launcher:
   module: dagster_docker
   class: DockerRunLauncher
   config:
+    image: gdelt-dagster:latest        # <-- the missing piece
     network: lakehouse-net
     env_vars:
+      # Required so the ephemeral run container can construct its own
+      # DagsterInstance and actually talk to Postgres. Without these,
+      # the container can't report run_storage/event_log_storage/
+      # schedule_storage events back at all -- including its own crash --
+      # which is why the run looked "stuck" in Dagit instead of failing.
+      - DAGSTER_POSTGRES_USER
+      - DAGSTER_POSTGRES_PASSWORD
+      - DAGSTER_POSTGRES_DB
       - AWS_ACCESS_KEY_ID
       - AWS_SECRET_ACCESS_KEY
       - CATALOG_URI
       - WAREHOUSE_BUCKET
+      - AWS_REGION
       - SPARK_MASTER_URL
       - SLACK_WEBHOOK_URL
+      - PYTHONPATH
     container_kwargs:
+      # lakehouse-net has no IPv6 route -- data.gdeltproject.org (and
+      # possibly other external hosts) publish AAAA records, so without
+      # this, every outbound request wastes a connection attempt on an
+      # unreachable IPv6 address before falling back to IPv4. Disabling
+      # IPv6 here makes that fallback unnecessary instead of relying on
+      # it working correctly every time.
+      sysctls:
+        net.ipv6.conf.all.disable_ipv6: "1"
       volumes:
+        # named volume -- fine for ephemeral containers too
         - "spark_jars:/opt/iceberg-jars:ro"

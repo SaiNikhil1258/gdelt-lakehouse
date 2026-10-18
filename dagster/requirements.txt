@@ -1,6 +1,8 @@
+# dagster/requirements.txt
 dagster==1.8.12
 dagster-webserver==1.8.12
 dagster-postgres==0.24.12
 dagster-docker==0.24.12
-pyspark==3.5
+pyspark==3.5.3
 requests==2.32.3
+boto3==1.35.36

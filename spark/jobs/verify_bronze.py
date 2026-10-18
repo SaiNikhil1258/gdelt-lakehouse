@@ -1,11 +1,13 @@
 from pyspark.sql import SparkSession
+from bronze_ingest import MENTIONS_KEY
+
 
 def main():
     spark = SparkSession.builder.appName("verify-bronze").getOrCreate()
 
     checks = {
         "events": ["GLOBALEVENTID"],
-        "mentions": ["GLOBALEVENTID", "MentionIdentifier", "mention_ts"],
+        "mentions": MENTIONS_KEY,
         "gkg": ["GKGRECORDID"],
     }
 
@@ -18,6 +20,7 @@ def main():
         print(f"{table:10s} total={total:6d}  distinct_key={distinct:6d}  null_keys={nulls:3d}  -> {status}")
 
     spark.stop()
+
 
 if __name__ == "__main__":
     main()

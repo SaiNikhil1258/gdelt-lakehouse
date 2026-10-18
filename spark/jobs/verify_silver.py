@@ -1,5 +1,6 @@
 from pyspark.sql import SparkSession, functions as F
 
+
 def main():
     spark = SparkSession.builder.appName("verify-silver").getOrCreate()
 
@@ -17,13 +18,19 @@ def main():
     status = "OK" if (total == distinct_ids and non_india == 0) else "PROBLEM"
     print(f"events_india: total={total} distinct_ids={distinct_ids} non_india_rows={non_india} -> {status}")
 
+    # Grain check: one row per (GLOBALEVENTID, MentionIdentifier). Anything more means a
+    # join fanned out or the collapse step failed.
     mentions = spark.table("local.silver.mentions_enriched")
     m_total = mentions.count()
+    m_pairs = mentions.select("GLOBALEVENTID", "MentionIdentifier").distinct().count()
     matched = mentions.filter(F.col("V2Themes").isNotNull()).count()
     match_rate = (matched / m_total) if m_total else 0
-    print(f"mentions_enriched: total={m_total} gkg_matched={matched} match_rate={match_rate:.1%}")
+    m_status = "OK" if m_total == m_pairs else "PROBLEM"
+    print(f"mentions_enriched: total={m_total} distinct_pairs={m_pairs} "
+          f"gkg_matched={matched} match_rate={match_rate:.1%} -> {m_status}")
 
     spark.stop()
+
 
 if __name__ == "__main__":
     main()
