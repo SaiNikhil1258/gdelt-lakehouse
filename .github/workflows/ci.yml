@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      # PySpark 3.5 needs a JVM (11 or 17)
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      # Only catches real errors (syntax errors, undefined names), so the
+      # existing diagnose_*/check_* scripts don't turn CI red on day one.
+      # Tighten the rule set later.
+      - name: Lint
+        run: ruff check --select E9,F63,F7,F82 .
+
+      - name: Unit tests
+        run: pytest -q

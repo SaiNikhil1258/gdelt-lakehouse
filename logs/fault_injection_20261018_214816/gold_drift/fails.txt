@@ -1,0 +1,1 @@
+FAIL  Silver -> Gold: bilateral event_count sums to the Silver rows it covers  -- silver_rows=38302 gold_sum=38307

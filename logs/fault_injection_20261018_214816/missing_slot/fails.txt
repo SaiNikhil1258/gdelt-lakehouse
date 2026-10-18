@@ -1,0 +1,3 @@
+FAIL  mentions: every day has 96 slots  -- 29/30 full days, 1 slots missing, short days (first 5): [('20260910', 95)]
+FAIL  mentions: landing files == Bronze slots per day  -- 1 days differ (day: (landing, bronze)), first 5: [('20260910', (96, 95))]
+FAIL  Bronze -> Silver: mentions_enriched rows == distinct (event, article) pairs  -- bronze_pairs=390444 silver=390711
