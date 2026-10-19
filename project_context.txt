@@ -1,40 +1,3 @@
-.env
----
-# ---- MinIO / S3 ----
-MINIO_ROOT_USER=admin
-MINIO_ROOT_PASSWORD=changeme123
-AWS_ACCESS_KEY_ID=admin
-AWS_SECRET_ACCESS_KEY=changeme123
-AWS_REGION=us-east-1
-AWS_SDK_V2_BUNDLE_VERSION=2.20.160
-WAREHOUSE_BUCKET=warehouse
-
-# ---- Iceberg REST Catalog: client-facing endpoint ----
-# Used by Spark and Dagster to REACH the catalog server.
-CATALOG_URI=http://iceberg-rest:8181
-
-# ---- Iceberg REST Catalog: its OWN backing store ----
-# A different concern from the line above -- this is where the catalog
-# SERVER persists table registrations. Without it, tables vanish on restart.
-ICEBERG_CATALOG_DB_USER=iceberg
-ICEBERG_CATALOG_DB_PASSWORD=iceberg
-ICEBERG_CATALOG_DB_NAME=iceberg_catalog
-
-# ---- Dagster's own run/event metadata store (unrelated to the above) ----
-POSTGRES_USER=dagster
-POSTGRES_PASSWORD=dagster
-POSTGRES_DB=dagster
-
-# ---- Alerting ----
-SLACK_WEBHOOK_URL=
-
-# ---- Pinned versions ----
-SPARK_VERSION=3.5.3
-ICEBERG_VERSION=1.6.1
-HADOOP_AWS_VERSION=3.3.4
-AWS_SDK_BUNDLE_VERSION=1.12.262
-
----
 docker-compose.yml
 ---
 
@@ -2673,23 +2636,23 @@ if __name__ == "__main__":
 spark/jobs/gold_aggregate.py
 ---
 from pyspark.sql import SparkSession, functions as F
+from utils import partner_country
+
+# The two daily tables are full recomputes, so they are replaced in one commit with
+# overwrite(F.lit(True)). overwritePartitions() only replaces partitions that appear in the
+# new data, so a month that no longer has any rows would keep its old rows forever.
 
 
-def build_bilateral_sentiment(spark):
-    events = spark.table("local.silver.events_india")
-
-    gold = (
+def compute_bilateral_sentiment(events):
+    """Silver events -> one row per (event_date, partner country). Only events where India
+    is exactly one of the two actors count; the other actor is the partner."""
+    return (
         events
         .withColumn(
             "partner_country",
-            F.when(F.col("Actor1CountryCode") == "IND", F.col("Actor2CountryCode"))
-             .otherwise(F.col("Actor1CountryCode"))
+            partner_country(F.col("Actor1CountryCode"), F.col("Actor2CountryCode")),
         )
-        .filter(
-            F.col("partner_country").isNotNull() &
-            (F.col("partner_country") != "IND") &
-            (F.col("partner_country") != "")
-        )
+        .filter(F.col("partner_country").isNotNull() & (F.col("partner_country") != ""))
         .groupBy("event_date", "partner_country")
         .agg(
             F.count("*").alias("event_count"),
@@ -2698,17 +2661,16 @@ def build_bilateral_sentiment(spark):
         )
     )
 
-    row_count = gold.count()
-    gold.writeTo("local.gold.india_bilateral_sentiment_daily").overwritePartitions()
-    return row_count
 
-
-def build_state_conflict(spark):
-    events = spark.table("local.silver.events_india")
-
-    gold = (
+def compute_state_conflict(events):
+    """Silver events -> one row per (event_date, Indian state, severity). Only events that
+    happened in India count."""
+    return (
         events
-        .filter(F.col("ActionGeo_ADM1Code").isNotNull())
+        .filter(
+            (F.col("ActionGeo_CountryCode") == "IN") &
+            F.col("ActionGeo_ADM1Code").isNotNull()
+        )
         .groupBy("event_date", "ActionGeo_ADM1Code", "conflict_severity")
         .agg(
             F.count("*").alias("event_count"),
@@ -2717,19 +2679,10 @@ def build_state_conflict(spark):
         .withColumnRenamed("ActionGeo_ADM1Code", "adm1_code")
     )
 
-    row_count = gold.count()
-    gold.writeTo("local.gold.india_state_conflict_daily").overwritePartitions()
-    return row_count
 
-
-def merge_mention_counts(spark):
-    """Upsert against the FULL current total for each event -- not an additive
-    delta. See discussion above: Silver is a full recompute, not incremental,
-    so this MERGE must replace each event's totals rather than add to them,
-    or re-running the pipeline would double-count on every run."""
-    mentions = spark.table("local.silver.mentions_enriched")
-
-    agg = (
+def compute_mention_counts(mentions):
+    """Silver mentions -> one row per event with its FULL current totals."""
+    return (
         mentions
         .groupBy("GLOBALEVENTID")
         .agg(
@@ -2738,6 +2691,28 @@ def merge_mention_counts(spark):
             F.avg("MentionDocTone").alias("running_avg_tone"),
         )
     )
+
+
+def build_bilateral_sentiment(spark):
+    gold = compute_bilateral_sentiment(spark.table("local.silver.events_india"))
+    row_count = gold.count()
+    gold.writeTo("local.gold.india_bilateral_sentiment_daily").overwrite(F.lit(True))
+    return row_count
+
+
+def build_state_conflict(spark):
+    gold = compute_state_conflict(spark.table("local.silver.events_india"))
+    row_count = gold.count()
+    gold.writeTo("local.gold.india_state_conflict_daily").overwrite(F.lit(True))
+    return row_count
+
+
+def merge_mention_counts(spark):
+    """Upsert against the FULL current total for each event -- not an additive
+    delta. Silver is a full recompute, not incremental, so this MERGE must replace
+    each event's totals rather than add to them, or re-running the pipeline would
+    double-count on every run."""
+    agg = compute_mention_counts(spark.table("local.silver.mentions_enriched"))
     agg.createOrReplaceTempView("mention_agg_source")
 
     spark.sql("""
@@ -2772,6 +2747,7 @@ def main():
     print(f"gold.india_event_mention_counts: merged against {m} distinct events")
 
     spark.stop()
+
 
 if __name__ == "__main__":
     main()
@@ -3107,13 +3083,13 @@ def create_all_silver_tables(spark):
 spark/jobs/silver_transform.py
 ---
 from pyspark.sql import SparkSession, functions as F
-from utils import normalize_url
+from utils import normalize_url, conflict_severity
 
 
-def transform_events_india(spark):
-    bronze_events = spark.table("local.bronze.events")
-
-    silver_events = (
+def build_events_india(bronze_events):
+    """Bronze events -> Silver India events. Pure DataFrame logic (no table access), so it
+    can be unit-tested on small fixtures."""
+    return (
         bronze_events
         .withColumn("event_date", F.to_date("SQLDATE", "yyyyMMdd"))
         .filter(
@@ -3122,13 +3098,7 @@ def transform_events_india(spark):
             (F.col("Actor2CountryCode") == "IND")
         )
         .filter(F.col("SOURCEURL").isNotNull() & F.col("GLOBALEVENTID").isNotNull())
-        .withColumn(
-            "conflict_severity",
-            F.when(F.col("QuadClass") == 4, "Material Conflict")
-             .when(F.col("QuadClass") == 3, "Verbal Conflict")
-             .when(F.col("QuadClass") == 2, "Material Cooperation")
-             .otherwise("Verbal Cooperation")
-        )
+        .withColumn("conflict_severity", conflict_severity(F.col("QuadClass")))
         .select(
             "GLOBALEVENTID", "event_date", "Actor1CountryCode", "Actor1Name",
             "Actor2CountryCode", "Actor2Name", "EventRootCode", "QuadClass",
@@ -3139,12 +3109,15 @@ def transform_events_india(spark):
         .dropDuplicates(["GLOBALEVENTID"])  # defensive; Bronze should already guarantee this
     )
 
+
+def transform_events_india(spark):
+    silver_events = build_events_india(spark.table("local.bronze.events"))
     row_count = silver_events.count()
     silver_events.writeTo("local.silver.events_india").overwritePartitions()
     return row_count
 
 
-def transform_mentions_enriched(spark):
+def build_mentions_enriched(bronze_mentions, bronze_gkg, silver_events):
     """One row per (GLOBALEVENTID, MentionIdentifier), i.e. per article that mentions an
     India-relevant event.
 
@@ -3160,9 +3133,7 @@ def transform_mentions_enriched(spark):
        This tie-break is a deterministic choice, not a verified 'best' row.
     3. LEFT JOIN, so mentions without a GKG record (e.g. during a GKG stall) are kept.
     """
-    bronze_mentions = spark.table("local.bronze.mentions")
-    bronze_gkg = spark.table("local.bronze.gkg")
-    silver_events = spark.table("local.silver.events_india").select("GLOBALEVENTID", "event_date")
+    silver_events = silver_events.select("GLOBALEVENTID", "event_date")
 
     pairs = (
         bronze_mentions.alias("m")
@@ -3198,7 +3169,7 @@ def transform_mentions_enriched(spark):
         )
     )
 
-    silver_mentions = (
+    return (
         pairs.join(gkg_one_per_url, "norm_url", "left")
         .select(
             "GLOBALEVENTID", "event_date", "MentionSourceName", "MentionIdentifier",
@@ -3206,6 +3177,13 @@ def transform_mentions_enriched(spark):
         )
     )
 
+
+def transform_mentions_enriched(spark):
+    silver_mentions = build_mentions_enriched(
+        spark.table("local.bronze.mentions"),
+        spark.table("local.bronze.gkg"),
+        spark.table("local.silver.events_india"),
+    )
     row_count = silver_mentions.count()
     silver_mentions.writeTo("local.silver.mentions_enriched").overwritePartitions()
     return row_count
@@ -3461,9 +3439,46 @@ spark/jobs/utils.py
 ---
 from pyspark.sql import functions as F
 
+# Query parameters that only track where a click came from. Anything else in the query
+# string (id=, p=, story=, ...) can identify the article itself and must be kept.
+TRACKING_PARAMS = (
+    r"utm_[a-z0-9_]*|fbclid|gclid|dclid|msclkid|mc_cid|mc_eid|igshid|ocid|ncid|cmpid"
+)
+
+
 def normalize_url(col):
-    """Lowercase, trim, strip query string — for the Mentions<->GKG soft join."""
-    return F.lower(F.trim(F.regexp_replace(col, r"\?.*$", "")))
+    """Lowercase, trim, drop the #fragment and tracking parameters -- for the
+    Mentions<->GKG soft join.
+
+    Unlike the previous version this keeps the rest of the query string, so that
+    'site.com/story.php?id=1' and 'site.com/story.php?id=2' stay different articles."""
+    s = F.lower(F.trim(col))
+    s = F.regexp_replace(s, r"#.*$", "")
+    s = F.regexp_replace(s, r"[?&](" + TRACKING_PARAMS + r")(=[^&]*)?", "")
+    # if the first parameter was removed, the next one starts with '&' instead of '?'
+    s = F.regexp_replace(s, r"^([^?]*)&", "$1?")
+    return s
+
+
+def conflict_severity(quad_class):
+    """GDELT QuadClass -> label. Unknown or NULL QuadClass stays NULL (it used to be
+    silently labelled 'Verbal Cooperation')."""
+    return (
+        F.when(quad_class == 4, "Material Conflict")
+         .when(quad_class == 3, "Verbal Conflict")
+         .when(quad_class == 2, "Material Cooperation")
+         .when(quad_class == 1, "Verbal Cooperation")
+    )
+
+
+def partner_country(actor1_country, actor2_country):
+    """The country India interacts with in an event, or NULL when India is not exactly
+    one of the two actors (India-India, no India actor, or the other actor is missing).
+    Events that merely happened in India no longer get Actor1 as a 'partner'."""
+    return (
+        F.when((actor1_country == "IND") & (actor2_country != "IND"), actor2_country)
+         .when((actor2_country == "IND") & (actor1_country != "IND"), actor1_country)
+    )
 
 def parse_gdelt_ts(col, fmt="yyyyMMddHHmmss"):
     return F.to_timestamp(col, fmt)
@@ -3497,6 +3512,7 @@ from datetime import datetime, timedelta
 from pyspark.sql import SparkSession, functions as F
 
 from bronze_ingest import MENTIONS_KEY
+from utils import partner_country
 
 LANDING = "s3a://gdelt-landing"
 
@@ -3624,7 +3640,7 @@ def main():
 
     out_of_range = spark.table(BRONZE["events"]["table"]).filter(
         (F.col("GoldsteinScale") < -10) | (F.col("GoldsteinScale") > 10)
-        | (~F.col("QuadClass").isin(1, 2, 3, 4))
+        | (F.col("QuadClass").isNull() | ~F.col("QuadClass").isin(1, 2, 3, 4))
         | (F.abs(F.col("AvgTone")) > 100)
         | (F.col("ActionGeo_Lat") < -90) | (F.col("ActionGeo_Lat") > 90)
         | (F.col("ActionGeo_Long") < -180) | (F.col("ActionGeo_Long") > 180)
@@ -3660,15 +3676,16 @@ def main():
     report.check("Silver: every mention belongs to a Silver event", orphans == 0,
                  f"orphan_mentions={orphans}")
 
-    partner = F.when(F.col("Actor1CountryCode") == "IND", F.col("Actor2CountryCode")) \
-               .otherwise(F.col("Actor1CountryCode"))
-    expected = silver_events.filter(partner.isNotNull() & (partner != "IND") & (partner != "")).count()
+    partner = partner_country(F.col("Actor1CountryCode"), F.col("Actor2CountryCode"))
+    expected = silver_events.filter(partner.isNotNull() & (partner != "")).count()
     actual = spark.table("local.gold.india_bilateral_sentiment_daily") \
         .agg(F.sum("event_count")).first()[0] or 0
     report.check("Silver -> Gold: bilateral event_count sums to the Silver rows it covers",
                  expected == actual, f"silver_rows={expected} gold_sum={actual}")
 
-    expected = silver_events.filter(F.col("ActionGeo_ADM1Code").isNotNull()).count()
+    expected = silver_events.filter(
+        (F.col("ActionGeo_CountryCode") == "IN") & F.col("ActionGeo_ADM1Code").isNotNull()
+    ).count()
     actual = spark.table("local.gold.india_state_conflict_daily") \
         .agg(F.sum("event_count")).first()[0] or 0
     report.check("Silver -> Gold: state-conflict event_count sums to the Silver rows it covers",
@@ -5872,5 +5889,670 @@ notebooks/gdelt_analysis.ipynb
  "nbformat_minor": 5
 }
 
+
+---
+tests/conftest.py
+---
+import pytest
+from pyspark.sql import SparkSession
+
+
+@pytest.fixture(scope="session")
+def spark():
+    """Small local Spark session shared by all tests (no cluster, no Iceberg)."""
+    session = (
+        SparkSession.builder.master("local[2]")
+        .appName("gdelt-unit-tests")
+        .config("spark.sql.shuffle.partitions", "2")
+        .config("spark.default.parallelism", "2")
+        .config("spark.ui.enabled", "false")
+        .config("spark.sql.session.timeZone", "UTC")
+        .getOrCreate()
+    )
+    yield session
+    session.stop()
+
+---
+tests/helpers.py
+---
+"""Small helper for building DataFrames in tests without spelling out every column."""
+
+
+def make_df(spark, schema, defaults, rows):
+    """Build a DataFrame from a DDL-style schema string. Each row is a dict that only needs
+    the columns it cares about; the rest come from `defaults`."""
+    cols = [part.split()[0] for part in schema.split(",")]
+    data = [tuple({**defaults, **row}[c] for c in cols) for row in rows]
+    return spark.createDataFrame(data, schema)
+
+---
+tests/test_backfill.py
+---
+"""Tests for the pure logic in scripts/backfill.py. No network, MinIO or Spark needed."""
+import argparse
+from datetime import date
+from types import SimpleNamespace
+
+import pytest
+
+import backfill
+
+
+# --------------------------------------------------------------------------- parse_date
+def test_parse_date_ok():
+    assert backfill.parse_date("20260901") == date(2026, 9, 1)
+
+
+@pytest.mark.parametrize("bad", ["2026-09-01", "20261301", "abc", "", "202609"])
+def test_parse_date_rejects_bad_input(bad):
+    with pytest.raises(argparse.ArgumentTypeError):
+        backfill.parse_date(bad)
+
+
+# --------------------------------------------------------------------------- timestamp_range
+def test_timestamp_range_one_day_has_96_slots():
+    stamps = list(backfill.timestamp_range(date(2026, 9, 1), date(2026, 9, 1)))
+    assert len(stamps) == 96
+    assert stamps[0] == "20260901000000"
+    assert stamps[1] == "20260901001500"
+    assert stamps[-1] == "20260901234500"
+    assert len(set(stamps)) == 96
+
+
+def test_timestamp_range_crosses_midnight_and_month_end():
+    stamps = list(backfill.timestamp_range(date(2026, 9, 30), date(2026, 10, 1)))
+    assert len(stamps) == 192
+    assert stamps[95] == "20260930234500"
+    assert stamps[96] == "20261001000000"
+
+
+# --------------------------------------------------------------------------- split_into_chunks
+def test_split_into_chunks_september_by_7_days():
+    chunks = list(backfill.split_into_chunks(date(2026, 9, 1), date(2026, 9, 30), 7))
+    assert len(chunks) == 5
+    assert chunks[0] == (date(2026, 9, 1), date(2026, 9, 7))
+    assert chunks[-1] == (date(2026, 9, 29), date(2026, 9, 30))
+
+
+@pytest.mark.parametrize("chunk_days", [1, 3, 7, 10, 45])
+def test_chunks_cover_range_exactly_once(chunk_days):
+    start, end = date(2026, 9, 1), date(2026, 10, 17)
+    chunks = list(backfill.split_into_chunks(start, end, chunk_days))
+    assert chunks[0][0] == start and chunks[-1][1] == end
+    for (_, prev_end), (next_start, _) in zip(chunks, chunks[1:]):
+        assert (next_start - prev_end).days == 1          # no gap, no overlap
+    assert all((b - a).days + 1 <= chunk_days for a, b in chunks)
+    assert sum((b - a).days + 1 for a, b in chunks) == (end - start).days + 1
+
+
+def test_split_into_chunks_single_day():
+    assert list(backfill.split_into_chunks(date(2026, 9, 1), date(2026, 9, 1), 7)) == [
+        (date(2026, 9, 1), date(2026, 9, 1))
+    ]
+
+
+# --------------------------------------------------------------------------- validate_arguments
+def make_args(**overrides):
+    base = dict(
+        start_date=date(2026, 9, 1),
+        end_date=date(2026, 9, 30),
+        workers=6,
+        retries=4,
+        chunk_days=7,
+        streams=["events", "mentions", "gkg"],
+        download_only=False,
+        ingest_only=False,
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def test_validate_arguments_accepts_good_args():
+    backfill.validate_arguments(make_args())
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        (dict(start_date=date(2026, 10, 1), end_date=date(2026, 9, 1)), "cannot be after"),
+        (dict(workers=0), "--workers"),
+        (dict(retries=0), "--retries"),
+        (dict(chunk_days=0), "--chunk-days"),
+        (dict(streams=["events", "bogus"]), "Invalid streams"),
+        (dict(download_only=True, ingest_only=True), "cannot be used together"),
+    ],
+)
+def test_validate_arguments_rejects_bad_args(overrides, message):
+    with pytest.raises(SystemExit) as exc:
+        backfill.validate_arguments(make_args(**overrides))
+    assert message in str(exc.value)
+
+
+# --------------------------------------------------------------------------- acquire_lock
+def test_second_backfill_cannot_take_the_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(backfill, "LOCK_PATH", str(tmp_path / ".backfill.lock"))
+    first = backfill.acquire_lock()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            backfill.acquire_lock()
+        assert "already running" in str(exc.value)
+    finally:
+        first.close()
+
+
+def test_lock_is_released_when_the_holder_closes(tmp_path, monkeypatch):
+    """The lock is an OS flock, so a leftover .backfill.lock FILE does not block anything."""
+    monkeypatch.setattr(backfill, "LOCK_PATH", str(tmp_path / ".backfill.lock"))
+    backfill.acquire_lock().close()
+    again = backfill.acquire_lock()      # must not raise
+    again.close()
+
+---
+tests/test_gold_aggregate.py
+---
+"""Tests for the Gold layer logic (spark/jobs/gold_aggregate.py) on tiny fixtures."""
+from datetime import date
+
+import pytest
+
+from gold_aggregate import (
+    compute_bilateral_sentiment,
+    compute_mention_counts,
+    compute_state_conflict,
+)
+from helpers import make_df
+
+SILVER_SCHEMA = (
+    "GLOBALEVENTID long, event_date date, Actor1CountryCode string, Actor2CountryCode string, "
+    "GoldsteinScale double, AvgTone double, ActionGeo_CountryCode string, "
+    "ActionGeo_ADM1Code string, conflict_severity string"
+)
+SILVER_DEFAULTS = dict(
+    GLOBALEVENTID=1, event_date=date(2026, 9, 15), Actor1CountryCode=None,
+    Actor2CountryCode=None, GoldsteinScale=0.0, AvgTone=0.0, ActionGeo_CountryCode=None,
+    ActionGeo_ADM1Code=None, conflict_severity="Verbal Cooperation",
+)
+
+D15, D16 = date(2026, 9, 15), date(2026, 9, 16)
+
+
+def silver(spark, *rows):
+    return make_df(spark, SILVER_SCHEMA, SILVER_DEFAULTS, rows)
+
+
+def bilateral_fixture(spark):
+    return silver(
+        spark,
+        dict(GLOBALEVENTID=1, Actor1CountryCode="IND", Actor2CountryCode="USA", GoldsteinScale=2.0, AvgTone=1.0),
+        dict(GLOBALEVENTID=2, Actor1CountryCode="USA", Actor2CountryCode="IND", GoldsteinScale=4.0, AvgTone=3.0),
+        dict(GLOBALEVENTID=3, Actor1CountryCode="IND", Actor2CountryCode="IND"),                 # domestic
+        dict(GLOBALEVENTID=4, Actor1CountryCode="USA", Actor2CountryCode="CHN",
+             ActionGeo_CountryCode="IN"),                                                        # India not an actor
+        dict(GLOBALEVENTID=5, Actor1CountryCode=None, Actor2CountryCode="IND"),                  # partner unknown
+        dict(GLOBALEVENTID=6, event_date=D16, Actor1CountryCode="IND", Actor2CountryCode="PAK", GoldsteinScale=-6.0),
+        dict(GLOBALEVENTID=7, Actor1CountryCode="IND", Actor2CountryCode=""),                    # empty partner
+    )
+
+
+# --------------------------------------------------------------------------- bilateral
+def test_bilateral_only_counts_events_where_india_is_exactly_one_actor(spark):
+    rows = {
+        (r["event_date"], r["partner_country"]): r
+        for r in compute_bilateral_sentiment(bilateral_fixture(spark)).collect()
+    }
+    assert set(rows) == {(D15, "USA"), (D16, "PAK")}
+
+    usa = rows[(D15, "USA")]
+    assert usa["event_count"] == 2
+    assert usa["avg_goldstein"] == pytest.approx(3.0)
+    assert usa["avg_tone"] == pytest.approx(2.0)
+
+    pak = rows[(D16, "PAK")]
+    assert pak["event_count"] == 1
+    assert pak["avg_goldstein"] == pytest.approx(-6.0)
+
+
+def test_bilateral_counts_add_up_to_the_qualifying_events(spark):
+    total = sum(r["event_count"] for r in compute_bilateral_sentiment(bilateral_fixture(spark)).collect())
+    assert total == 3      # events 1, 2 and 6
+
+
+# --------------------------------------------------------------------------- state conflict
+def test_state_conflict_only_counts_events_that_happened_in_india(spark):
+    df = silver(
+        spark,
+        dict(GLOBALEVENTID=1, ActionGeo_CountryCode="IN", ActionGeo_ADM1Code="IN07",
+             conflict_severity="Material Conflict", GoldsteinScale=-5.0),
+        dict(GLOBALEVENTID=2, ActionGeo_CountryCode="IN", ActionGeo_ADM1Code="IN07",
+             conflict_severity="Material Conflict", GoldsteinScale=-3.0),
+        dict(GLOBALEVENTID=3, ActionGeo_CountryCode="IN", ActionGeo_ADM1Code="IN07",
+             conflict_severity="Verbal Cooperation", GoldsteinScale=3.0),
+        dict(GLOBALEVENTID=4, ActionGeo_CountryCode="US", ActionGeo_ADM1Code="USCA",
+             Actor1CountryCode="IND"),                                    # India actor, foreign region
+        dict(GLOBALEVENTID=5, ActionGeo_CountryCode="IN", ActionGeo_ADM1Code=None),   # no state known
+    )
+    rows = {
+        (r["event_date"], r["adm1_code"], r["conflict_severity"]): r
+        for r in compute_state_conflict(df).collect()
+    }
+    assert set(rows) == {
+        (D15, "IN07", "Material Conflict"),
+        (D15, "IN07", "Verbal Cooperation"),
+    }
+    conflict = rows[(D15, "IN07", "Material Conflict")]
+    assert conflict["event_count"] == 2
+    assert conflict["avg_goldstein"] == pytest.approx(-4.0)
+    assert rows[(D15, "IN07", "Verbal Cooperation")]["event_count"] == 1
+
+
+def test_state_conflict_output_columns_match_the_gold_table(spark):
+    df = silver(spark, dict(ActionGeo_CountryCode="IN", ActionGeo_ADM1Code="IN07"))
+    assert compute_state_conflict(df).columns == [
+        "event_date", "adm1_code", "conflict_severity", "event_count", "avg_goldstein",
+    ]
+
+
+# --------------------------------------------------------------------------- mention counts
+def test_mention_counts_are_full_totals_per_event(spark):
+    mentions = make_df(
+        spark,
+        "GLOBALEVENTID long, MentionSourceName string, MentionDocTone double",
+        dict(GLOBALEVENTID=1, MentionSourceName="a.com", MentionDocTone=0.0),
+        [
+            dict(GLOBALEVENTID=1, MentionSourceName="a.com", MentionDocTone=2.0),
+            dict(GLOBALEVENTID=1, MentionSourceName="a.com", MentionDocTone=4.0),
+            dict(GLOBALEVENTID=1, MentionSourceName="b.com", MentionDocTone=6.0),
+            dict(GLOBALEVENTID=2, MentionSourceName="a.com", MentionDocTone=-1.0),
+        ],
+    )
+    rows = {r["GLOBALEVENTID"]: r for r in compute_mention_counts(mentions).collect()}
+    assert set(rows) == {1, 2}
+    assert (rows[1]["total_mentions"], rows[1]["total_sources"]) == (3, 2)
+    assert rows[1]["running_avg_tone"] == pytest.approx(4.0)
+    assert (rows[2]["total_mentions"], rows[2]["total_sources"]) == (1, 1)
+    assert rows[2]["running_avg_tone"] == pytest.approx(-1.0)
+
+---
+tests/test_silver_transform.py
+---
+"""Tests for the Silver layer logic (spark/jobs/silver_transform.py) on tiny fixtures."""
+from datetime import date, datetime
+
+from helpers import make_df
+from silver_transform import build_events_india, build_mentions_enriched
+
+# --------------------------------------------------------------------------- fixtures
+EVENT_SCHEMA = (
+    "GLOBALEVENTID long, SQLDATE string, Actor1CountryCode string, Actor1Name string, "
+    "Actor2CountryCode string, Actor2Name string, EventRootCode string, QuadClass int, "
+    "GoldsteinScale double, AvgTone double, ActionGeo_CountryCode string, "
+    "ActionGeo_ADM1Code string, ActionGeo_Lat double, ActionGeo_Long double, SOURCEURL string"
+)
+EVENT_DEFAULTS = dict(
+    GLOBALEVENTID=1, SQLDATE="20260915", Actor1CountryCode=None, Actor1Name=None,
+    Actor2CountryCode=None, Actor2Name=None, EventRootCode="01", QuadClass=1,
+    GoldsteinScale=1.0, AvgTone=0.0, ActionGeo_CountryCode=None, ActionGeo_ADM1Code=None,
+    ActionGeo_Lat=None, ActionGeo_Long=None, SOURCEURL="http://x.com/a",
+)
+
+MENTION_SCHEMA = (
+    "GLOBALEVENTID long, MentionIdentifier string, MentionSourceName string, "
+    "MentionDocTone double, Confidence int"
+)
+MENTION_DEFAULTS = dict(
+    GLOBALEVENTID=1, MentionIdentifier="http://a.com/x", MentionSourceName="a.com",
+    MentionDocTone=0.0, Confidence=50,
+)
+
+GKG_SCHEMA = (
+    "GKGRECORDID string, gkg_ts timestamp, DocumentIdentifier string, "
+    "V2Themes string, V2Tone string"
+)
+GKG_DEFAULTS = dict(
+    GKGRECORDID="20260915000000-1", gkg_ts=datetime(2026, 9, 15, 0, 0, 0),
+    DocumentIdentifier="http://a.com/x", V2Themes="THEME", V2Tone="1,2,3",
+)
+
+SILVER_EVENT_SCHEMA = "GLOBALEVENTID long, event_date date"
+SILVER_EVENT_DEFAULTS = dict(GLOBALEVENTID=1, event_date=date(2026, 9, 15))
+
+
+def events(spark, *rows):
+    return make_df(spark, EVENT_SCHEMA, EVENT_DEFAULTS, rows)
+
+
+def run_mentions(spark, mentions, gkg=(), silver_events=({},)):
+    result = build_mentions_enriched(
+        make_df(spark, MENTION_SCHEMA, MENTION_DEFAULTS, mentions),
+        make_df(spark, GKG_SCHEMA, GKG_DEFAULTS, gkg),
+        make_df(spark, SILVER_EVENT_SCHEMA, SILVER_EVENT_DEFAULTS, silver_events),
+    )
+    return [r.asDict() for r in result.collect()]
+
+
+# --------------------------------------------------------------------------- events_india
+def test_keeps_events_where_india_is_involved_in_any_way(spark):
+    df = events(
+        spark,
+        dict(GLOBALEVENTID=1, ActionGeo_CountryCode="IN"),                          # happened in India
+        dict(GLOBALEVENTID=2, Actor1CountryCode="IND"),                             # India actor 1
+        dict(GLOBALEVENTID=3, Actor2CountryCode="IND"),                             # India actor 2
+        dict(GLOBALEVENTID=4, Actor1CountryCode="USA", ActionGeo_CountryCode="US"),  # no India
+        dict(GLOBALEVENTID=5),                                                       # all NULL
+    )
+    ids = sorted(r[0] for r in build_events_india(df).select("GLOBALEVENTID").collect())
+    assert ids == [1, 2, 3]
+
+
+def test_drops_events_without_source_url(spark):
+    df = events(
+        spark,
+        dict(GLOBALEVENTID=1, ActionGeo_CountryCode="IN", SOURCEURL=None),
+        dict(GLOBALEVENTID=2, ActionGeo_CountryCode="IN"),
+    )
+    ids = [r[0] for r in build_events_india(df).select("GLOBALEVENTID").collect()]
+    assert ids == [2]
+
+
+def test_event_date_is_parsed_from_sqldate(spark):
+    df = events(spark, dict(ActionGeo_CountryCode="IN", SQLDATE="20260915"))
+    assert build_events_india(df).first()["event_date"] == date(2026, 9, 15)
+
+
+def test_conflict_severity_labels(spark):
+    df = events(
+        spark,
+        *[dict(GLOBALEVENTID=i, ActionGeo_CountryCode="IN", QuadClass=q)
+          for i, q in [(1, 1), (2, 2), (3, 3), (4, 4), (5, None)]],
+    )
+    labels = {r["GLOBALEVENTID"]: r["conflict_severity"] for r in build_events_india(df).collect()}
+    assert labels == {
+        1: "Verbal Cooperation",
+        2: "Material Cooperation",
+        3: "Verbal Conflict",
+        4: "Material Conflict",
+        5: None,
+    }
+
+
+def test_duplicate_event_ids_collapse_to_one_row(spark):
+    df = events(
+        spark,
+        dict(GLOBALEVENTID=7, ActionGeo_CountryCode="IN"),
+        dict(GLOBALEVENTID=7, ActionGeo_CountryCode="IN"),
+    )
+    assert build_events_india(df).count() == 1
+
+
+def test_events_output_columns_match_the_silver_table(spark):
+    df = events(spark, dict(ActionGeo_CountryCode="IN"))
+    assert build_events_india(df).columns == [
+        "GLOBALEVENTID", "event_date", "Actor1CountryCode", "Actor1Name",
+        "Actor2CountryCode", "Actor2Name", "EventRootCode", "QuadClass",
+        "conflict_severity", "GoldsteinScale", "AvgTone",
+        "ActionGeo_CountryCode", "ActionGeo_ADM1Code", "ActionGeo_Lat", "ActionGeo_Long",
+        "SOURCEURL",
+    ]
+
+
+# --------------------------------------------------------------------------- mentions_enriched
+def test_mentions_of_events_outside_silver_are_dropped(spark):
+    rows = run_mentions(
+        spark,
+        mentions=[dict(GLOBALEVENTID=1), dict(GLOBALEVENTID=2)],
+        silver_events=[dict(GLOBALEVENTID=1)],
+    )
+    assert [r["GLOBALEVENTID"] for r in rows] == [1]
+
+
+def test_duplicate_event_article_rows_collapse_keeping_highest_confidence(spark):
+    rows = run_mentions(
+        spark,
+        mentions=[dict(Confidence=40), dict(Confidence=60)],   # same (event, article) twice
+    )
+    assert len(rows) == 1
+    assert rows[0]["Confidence"] == 60
+
+
+def test_same_article_for_two_events_gives_two_rows(spark):
+    rows = run_mentions(
+        spark,
+        mentions=[dict(GLOBALEVENTID=1), dict(GLOBALEVENTID=2)],
+        silver_events=[dict(GLOBALEVENTID=1), dict(GLOBALEVENTID=2)],
+    )
+    assert sorted(r["GLOBALEVENTID"] for r in rows) == [1, 2]
+
+
+def test_mention_without_gkg_record_is_kept(spark):
+    rows = run_mentions(spark, mentions=[dict()], gkg=[])
+    assert len(rows) == 1
+    assert rows[0]["V2Themes"] is None and rows[0]["V2Tone"] is None
+
+
+def test_gkg_rows_sharing_a_url_do_not_multiply_mentions_and_latest_wins(spark):
+    rows = run_mentions(
+        spark,
+        mentions=[dict()],
+        gkg=[
+            dict(GKGRECORDID="20260915000000-1", gkg_ts=datetime(2026, 9, 15, 0, 0, 0), V2Themes="OLD"),
+            dict(GKGRECORDID="20260915001500-1", gkg_ts=datetime(2026, 9, 15, 0, 15, 0), V2Themes="NEW"),
+        ],
+    )
+    assert len(rows) == 1
+    assert rows[0]["V2Themes"] == "NEW"
+
+
+def test_gkg_timestamp_tie_is_broken_by_record_id(spark):
+    same_ts = datetime(2026, 9, 15, 0, 0, 0)
+    rows = run_mentions(
+        spark,
+        mentions=[dict()],
+        gkg=[
+            dict(GKGRECORDID="20260915000000-1", gkg_ts=same_ts, V2Themes="FIRST"),
+            dict(GKGRECORDID="20260915000000-2", gkg_ts=same_ts, V2Themes="SECOND"),
+        ],
+    )
+    assert len(rows) == 1
+    assert rows[0]["V2Themes"] == "SECOND"
+
+
+def test_tracking_parameters_do_not_prevent_a_gkg_match(spark):
+    rows = run_mentions(
+        spark,
+        mentions=[dict(MentionIdentifier="http://a.com/x?utm_source=tw")],
+        gkg=[dict(DocumentIdentifier="http://a.com/x")],
+    )
+    assert rows[0]["V2Themes"] == "THEME"
+
+
+def test_articles_that_differ_only_by_id_parameter_do_not_cross_match(spark):
+    rows = run_mentions(
+        spark,
+        mentions=[dict(MentionIdentifier="http://a.com/s.php?id=1")],
+        gkg=[dict(DocumentIdentifier="http://a.com/s.php?id=2", V2Themes="OTHER")],
+    )
+    assert len(rows) == 1
+    assert rows[0]["V2Themes"] is None
+
+
+def test_gkg_rows_without_document_identifier_are_ignored(spark):
+    rows = run_mentions(
+        spark,
+        mentions=[dict()],
+        gkg=[
+            dict(GKGRECORDID="broken", DocumentIdentifier=None, V2Themes="JUNK"),
+            dict(),
+        ],
+    )
+    assert len(rows) == 1
+    assert rows[0]["V2Themes"] == "THEME"
+
+---
+tests/test_spark_smoke.py
+---
+def test_spark_session_works(spark):
+    df = spark.createDataFrame([(1, "a"), (2, "b")], ["id", "val"])
+    assert df.count() == 2
+    assert df.filter("id = 2").first()["val"] == "b"
+
+---
+tests/test_utils.py
+---
+"""Tests for spark/jobs/utils.py -- the logic shared by Silver, Gold and verify_all."""
+import pytest
+from pyspark.sql import functions as F
+
+from utils import conflict_severity, extract_batch_id, normalize_url, partner_country
+
+
+# --------------------------------------------------------------------------- normalize_url
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        # case, whitespace, fragment
+        ("  https://Site.com/Story  ", "https://site.com/story"),
+        ("https://site.com/a#comments", "https://site.com/a"),
+        # tracking parameters are dropped ...
+        ("https://site.com/a?utm_source=x", "https://site.com/a"),
+        ("https://site.com/a?utm_medium=1&utm_campaign=2", "https://site.com/a"),
+        ("https://site.com/a?fbclid=abc", "https://site.com/a"),
+        # ... in any position, without breaking the remaining query string
+        ("https://site.com/a?utm_source=x&id=5", "https://site.com/a?id=5"),
+        ("https://site.com/a?id=5&utm_source=x", "https://site.com/a?id=5"),
+        ("https://site.com/a?id=5&fbclid=z&p=2", "https://site.com/a?id=5&p=2"),
+        # parameters that identify the article are kept
+        ("https://site.com/story.php?id=5", "https://site.com/story.php?id=5"),
+        ("https://site.com/?p=123", "https://site.com/?p=123"),
+    ],
+)
+def test_normalize_url(spark, raw, expected):
+    df = spark.createDataFrame([(raw,)], ["url"])
+    assert df.select(normalize_url(F.col("url"))).first()[0] == expected
+
+
+def test_normalize_url_keeps_different_articles_apart(spark):
+    """The bug this guards against: stripping the whole query string used to merge
+    story.php?id=1 and story.php?id=2, so one GKG row got attached to both."""
+    df = spark.createDataFrame(
+        [("https://site.com/story.php?id=1",), ("https://site.com/story.php?id=2",)], ["url"]
+    )
+    distinct = df.select(normalize_url(F.col("url")).alias("n")).distinct().count()
+    assert distinct == 2
+
+
+def test_normalize_url_merges_same_article_with_tracking_noise(spark):
+    df = spark.createDataFrame(
+        [("https://site.com/a?id=1",), ("https://site.com/a?id=1&utm_source=tw",)], ["url"]
+    )
+    assert df.select(normalize_url(F.col("url")).alias("n")).distinct().count() == 1
+
+
+def test_normalize_url_null_stays_null(spark):
+    df = spark.createDataFrame([(None,)], "url string")
+    assert df.select(normalize_url(F.col("url"))).first()[0] is None
+
+
+# --------------------------------------------------------------------------- conflict_severity
+@pytest.mark.parametrize(
+    "quad, expected",
+    [
+        (1, "Verbal Cooperation"),
+        (2, "Material Cooperation"),
+        (3, "Verbal Conflict"),
+        (4, "Material Conflict"),
+        (None, None),   # used to become "Verbal Cooperation"
+        (9, None),      # unknown code must not be mislabelled either
+    ],
+)
+def test_conflict_severity(spark, quad, expected):
+    df = spark.createDataFrame([(quad,)], "quad int")
+    assert df.select(conflict_severity(F.col("quad"))).first()[0] == expected
+
+
+# --------------------------------------------------------------------------- partner_country
+@pytest.mark.parametrize(
+    "actor1, actor2, expected",
+    [
+        ("IND", "USA", "USA"),     # India is actor 1
+        ("USA", "IND", "USA"),     # India is actor 2
+        ("IND", "IND", None),      # domestic
+        ("USA", "CHN", None),      # happened in India maybe, but India is not an actor
+        (None, "IND", None),       # other actor unknown
+        ("IND", None, None),
+        (None, None, None),
+        ("IND", "", ""),           # empty partner is returned as-is; Gold filters it out
+    ],
+)
+def test_partner_country(spark, actor1, actor2, expected):
+    df = spark.createDataFrame([(actor1, actor2)], "a1 string, a2 string")
+    result = df.select(partner_country(F.col("a1"), F.col("a2"))).first()[0]
+    assert result == expected
+
+
+# --------------------------------------------------------------------------- extract_batch_id
+def test_extract_batch_id():
+    assert extract_batch_id("20260910143000.export.CSV") == "20260910143000"
+    assert extract_batch_id("s3a://gdelt-landing/events/20260910143000.csv") == "20260910143000"
+
+---
+.github/workflows/ci.yml
+---
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      # PySpark 3.5 needs a JVM (11 or 17)
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      # Only catches real errors (syntax errors, undefined names), so the
+      # existing diagnose_*/check_* scripts don't turn CI red on day one.
+      # Tighten the rule set later.
+      - name: Lint
+        run: ruff check --select E9,F63,F7,F82 .
+
+      - name: Unit tests
+        run: pytest -q
+
+---
+pytest.ini
+---
+[pytest]
+testpaths = tests
+pythonpath = spark/jobs dagster scripts
+
+---
+requirements-dev.txt
+---
+pyspark==3.5.3
+boto3==1.35.36
+requests==2.32.3
+pytest>=8,<9
+ruff>=0.6
 
 ---
