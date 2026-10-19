@@ -1,0 +1,21 @@
+# CI-only overrides, layered on top of docker-compose.yml:
+#   COMPOSE_FILE=docker-compose.yml:ci/docker-compose.ci.yml
+#
+# Swaps the MinIO server and the mc client (both deleted from Docker Hub) for one image built
+# from source in ci/minio-local. Everything else is untouched. The image has wget but no curl,
+# so the health check is rewritten.
+services:
+  minio:
+    image: minio-local:RELEASE.2025-10-15T17-29-55Z
+    build:
+      context: ./ci/minio-local
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9000/minio/health/live || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  mc-init:
+    image: minio-local:RELEASE.2025-10-15T17-29-55Z
+    build:
+      context: ./ci/minio-local

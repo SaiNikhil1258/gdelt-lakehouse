@@ -1,4 +1,4 @@
-o#!/usr/bin/env bash
+#!/usr/bin/env bash
 # CI pipeline test: Compose stack -> synthetic sample -> Bronze -> Silver -> Gold -> checks.
 # Needs a .env (in CI: cp ci/ci.env .env).
 # Usage: bash scripts/ci_pipeline_smoke.sh
@@ -8,6 +8,10 @@ o#!/usr/bin/env bash
 # that), or on a throw-away stack if you set I_AM_ON_A_THROWAWAY_STACK=yes.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# Use the CI override (MinIO built from source) for every `docker compose` call below.
+export COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.yml:ci/docker-compose.ci.yml}"
+MINIO_IMAGE="minio-local:RELEASE.2025-10-15T17-29-55Z"
 
 if [ "${CI:-}" != "true" ] && [ "${I_AM_ON_A_THROWAWAY_STACK:-}" != "yes" ]; then
   echo "Refusing to run: this would add fake rows to the lakehouse that is running here."
@@ -61,7 +65,7 @@ step "Generate the sample and upload it to the landing bucket"
 rm -rf "$SAMPLE_DIR"
 python3 scripts/make_ci_sample.py --out "$SAMPLE_DIR"
 set -a; . ./.env; set +a
-docker run --rm --network lakehouse-net -v "$SAMPLE_DIR":/sample:ro --entrypoint /bin/sh minio/mc -c \
+docker run --rm --network lakehouse-net -v "$SAMPLE_DIR":/sample:ro --entrypoint /bin/sh "$MINIO_IMAGE" -c \
   "mc alias set local http://minio:9000 '$MINIO_ROOT_USER' '$MINIO_ROOT_PASSWORD' > /dev/null && mc mirror /sample local/gdelt-landing"
 
 run_job bootstrap_bronze bootstrap_bronze.py

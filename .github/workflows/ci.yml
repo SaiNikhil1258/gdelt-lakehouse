@@ -44,12 +44,18 @@ jobs:
   pipeline-test:
     needs: lint-and-test
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 40
+    env:
+      # MinIO's Docker Hub images are gone; the override builds MinIO from source instead.
+      COMPOSE_FILE: docker-compose.yml:ci/docker-compose.ci.yml
     steps:
       - uses: actions/checkout@v4
 
       - name: Use the CI environment file
         run: cp ci/ci.env .env
+
+      - name: Check that every other image can be pulled
+        run: bash ci/check_images.sh
 
       - name: Pipeline test on the synthetic sample
         run: bash scripts/ci_pipeline_smoke.sh
